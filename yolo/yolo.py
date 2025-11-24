@@ -8,7 +8,7 @@ results = model.track(
     show=False,
     tracker="bytetrack.yaml",
     classes=[0],
-    persist=True
+    persist=True,stream=True
 )
 
 # Для хранения истории позиций
