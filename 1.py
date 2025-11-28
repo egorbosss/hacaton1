@@ -9,9 +9,10 @@ from gs_writer import append_event
 
 VIDEO_PATH = "videos/test.mp4"
 MODEL_PATH = "yolo11x.pt"
-USE_CUDA = True
+train_arrived = False
 
-DEVICE = "cpu"
+# Используем только CUDA
+DEVICE = "cuda"
 
 MAX_FRAME_GAP = 10 ** 10
 MAX_REID_DISTANCE = 80
@@ -87,18 +88,22 @@ PROCESSED_VIDEO_PATH = ensure_20_fps(VIDEO_PATH)
 
 model = YOLO(MODEL_PATH)
 
+# Используем только CUDA
 results = model.track(
     source=PROCESSED_VIDEO_PATH,
     stream=True,
     show=False,
     tracker="bytetrack.yaml",
-    classes=[0],
+    classes=[0, 6],
     persist=True,
-    device=DEVICE,
-    imgsz=480
+    device=DEVICE,  # Только CUDA
+    imgsz=640,      # Увеличиваем размер для лучшего качества
+    conf=0.5,
+    iou=0.5,
+    verbose=True
 )
 
-window_name = "People tracking"
+window_name = "People tracking - GPU"
 cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
 cv2.resizeWindow(window_name, 800, 600)
 
@@ -205,7 +210,7 @@ for result in results:
 
     cv2.putText(
         frame,
-        f"People tracked: {len(global_state)}",
+        f"People tracked: {len(global_state)} | GPU",
         (10, 30),
         cv2.FONT_HERSHEY_SIMPLEX,
         0.7,
@@ -227,4 +232,4 @@ send_queue.join()
 send_queue.put(None)
 sender_thread.join()
 
-print("\nГотово: обработка завершена.")
+print("\nГотово: обработка завершена на GPU.")
