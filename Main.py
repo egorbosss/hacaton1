@@ -1,5 +1,6 @@
 from ultralytics import YOLO
 import cv2
+import os
 import collections
 import math
 import torch
@@ -48,6 +49,20 @@ TRAIN_RESET_FRAMES = 200
 # Уменьшение FPS исходного видео
 # --------------------------------------------------
 def ensure_20_fps(video_path: str, target_fps: int = 5) -> str:
+    # базовое имя + расширение
+    base, ext = os.path.splitext(video_path)
+    if ext == "":
+        ext = ".mp4"
+
+    # имя файла с нужным fps, например video_fps15.mp4
+    out_path = f"{base}_fps{target_fps}{ext}"
+
+    # 1) если уже есть перерасчитанное видео — просто используем его
+    if os.path.exists(out_path):
+        print(f"[FPS] найден уже пережатый файл: {out_path}, повторное сжатие не требуется")
+        return out_path
+
+    # 2) иначе — как раньше, считаем fps и при необходимости пережимаем
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
         print("Не удалось открыть видео:", video_path)
@@ -67,12 +82,6 @@ def ensure_20_fps(video_path: str, target_fps: int = 5) -> str:
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
 
     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-    parts = video_path.rsplit(".", 1)
-    if len(parts) == 2:
-        out_path = parts[0] + f"_fps{target_fps}." + parts[1]
-    else:
-        out_path = video_path + f"_fps{target_fps}.mp4"
-
     out = cv2.VideoWriter(out_path, fourcc, target_fps, (width, height))
 
     ratio = orig_fps / target_fps
@@ -223,12 +232,21 @@ def run_dashboard():
     Запуск: streamlit run Main.py
     """
     # ----- ОФОРМЛЕНИЕ СТРАНИЦЫ -----
-    st.set_page_config(page_title="Хакатон – Дашборд", layout="wide")
+    st.set_page_config(page_title="DFN – СИБИНТЕК", layout="wide")
 
     st.markdown("""
     <style>
+    p {
+            color: #201600;
+    }
+    .stMainBlockContainer {
+            background-color: #ffffff;
+    }
+    .stMain {
+            background-color: #ffffff;
+    }
     .block-yellow {
-        background-color: #e8b021;
+        background-color: #f6ce45;
         padding: 10px;
         color: #000;
         font-size: 22px;
@@ -238,7 +256,7 @@ def run_dashboard():
         margin-bottom: 10px;
     }
     .block-dark {
-        background-color: #2f2f2f;
+        background-color: #0e0f10;
         padding: 10px;
         color: #fff;
         font-size: 22px;
@@ -251,6 +269,7 @@ def run_dashboard():
         font-size: 52px;
         font-weight: 900;
         text-align: center;
+        color: #0e0f10
     }
     </style>
     """, unsafe_allow_html=True)
@@ -259,6 +278,8 @@ def run_dashboard():
     top_left, top_center, top_right = st.columns([2, 3, 1])
     with top_center:
         time_placeholder = st.empty()
+    with top_left:
+        st.image("static/logo.svg", width=200)
 
     # основная сетка
     video_col, people_col, train_col = st.columns([3, 2, 2])
