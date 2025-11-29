@@ -185,17 +185,15 @@ def analyze_train_movement(positions, sizes):
         last_size = sizes[-1]
         rel_size_change = (last_size - first_size) / first_size
 
-    if avg_step < 0.3 and abs(rel_size_change) < 0.02:
-        return "Stopped"
-
+    # Упрощенная логика: только прибыл или уехал
     if rel_size_change > 0.05:
-        return "Arriving"
-    if rel_size_change < -0.05:
-        return "Departing"
-
-    if avg_step < 2.0:
-        return "Moving slowly"
-    return "Arriving"
+        return "Arrived"
+    elif rel_size_change < -0.05:
+        return "Departed"
+    elif avg_step < 0.3 and abs(rel_size_change) < 0.02:
+        return "Stopped"
+    else:
+        return "Stopped"
 
 
 def find_matching_global_id(center, frame_idx, obj_class, global_state):
@@ -233,9 +231,18 @@ class ActionHistory:
     def __init__(self, max_history_per_id=50):
         self.history = collections.defaultdict(lambda: collections.deque(maxlen=max_history_per_id))
         self.last_actions = {}  # последнее действие для каждого ID
+        self.arrival_times = {}  # время прибытия для поездов
+        self.departure_times = {}  # время отправления для поездов
 
     def record_action(self, obj_id, action, timestamp):
         """Записывает действие с временной меткой"""
+        # Для поездов сохраняем время прибытия и отправления
+        if obj_id.startswith('T'):  # Это поезд
+            if action == "Arrived" and obj_id not in self.arrival_times:
+                self.arrival_times[obj_id] = timestamp
+            elif action == "Departed" and obj_id not in self.departure_times:
+                self.departure_times[obj_id] = timestamp
+
         # Если действие изменилось, записываем новую запись
         if obj_id not in self.last_actions or self.last_actions[obj_id] != action:
             self.history[obj_id].append({
@@ -250,6 +257,14 @@ class ActionHistory:
             current_record = self.history[obj_id][-1]
             if current_record["action"] == action:
                 current_record["duration"] = timestamp - current_record["timestamp"]
+
+    def get_arrival_time(self, obj_id):
+        """Возвращает время прибытия поезда"""
+        return self.arrival_times.get(obj_id)
+
+    def get_departure_time(self, obj_id):
+        """Возвращает время отправления поезда"""
+        return self.departure_times.get(obj_id)
 
     def get_action_history(self, obj_id):
         """Возвращает историю действий для объекта"""
@@ -267,8 +282,36 @@ class ActionHistory:
             return f"{current['action']} ({duration_seconds:.1f}s)"
         return "Unknown"
 
+    def get_train_status_summary(self, obj_id):
+        """Возвращает сводку статуса поезда с временем прибытия/отправления"""
+        if not obj_id.startswith('T'):
+            return "Not a train"
+
+        arrival = self.get_arrival_time(obj_id)
+        departure = self.get_departure_time(obj_id)
+        current_action = self.get_current_action(obj_id)
+
+        status_parts = []
+
+        if arrival:
+            status_parts.append(f"Прибыл: {arrival.strftime('%H:%M:%S')}")
+        else:
+            status_parts.append("Прибыл: --:--:--")
+
+        if departure:
+            status_parts.append(f"Уехал: {departure.strftime('%H:%M:%S')}")
+        else:
+            status_parts.append("Уехал: --:--:--")
+
+        return " | ".join(status_parts)
+
     def get_recent_actions_summary(self, obj_id, max_actions=3):
         """Возвращает краткую сводку последних действий"""
+        # Для поездов показываем статус с временем
+        if obj_id.startswith('T'):
+            return self.get_train_status_summary(obj_id)
+
+        # Для людей - обычная история действий
         history = self.get_action_history(obj_id)
         if not history:
             return "No history"
@@ -334,6 +377,16 @@ def run_dashboard():
     .history-cell {
         max-width: 300px;
         font-size: 12px;
+    }
+    .train-status {
+        font-size: 14px;
+        font-weight: bold;
+    }
+    .arrived {
+        color: #28a745;
+    }
+    .departed {
+        color: #dc3545;
     }
     </style>
     """, unsafe_allow_html=True)
@@ -485,13 +538,19 @@ def run_dashboard():
                     # Записываем действие с временем
                     action_history.record_action(global_id, action, current_time)
 
+                    # Получаем время прибытия и отправления
+                    arrival_time = action_history.get_arrival_time(global_id)
+                    departure_time = action_history.get_departure_time(global_id)
+
+                    arrival_str = arrival_time.strftime("%H:%M:%S") if arrival_time else "--:--:--"
+                    departure_str = departure_time.strftime("%H:%M:%S") if departure_time else "--:--:--"
+
                     trains_out.append({
                         "ID": global_id,
-                        "Action": action_history.get_current_action_with_duration(global_id),
-                        "History": action_history.get_recent_actions_summary(global_id),
-                        "First Seen": action_history.get_action_history(global_id)[0]["timestamp"].strftime(
-                            "%H:%M:%S") if action_history.get_action_history(global_id) else "N/A",
-                        "Frame": frame_idx
+                        "Status": action,
+                        "Arrived": arrival_str,
+                        "Departed": departure_str,
+                        "Current Action": action_history.get_current_action_with_duration(global_id)
                     })
                 else:
                     movement_action = analyze_person_movement(position_history[global_id])
@@ -542,20 +601,6 @@ def run_dashboard():
                     2
                 )
 
-        # счётчики
-        person_count = sum(1 for state in global_state.values() if state["class"] == 0)
-        train_count = sum(1 for state in global_state.values() if state["class"] == 6)
-
-        cv2.putText(
-            frame,
-            f"People: {person_count} | Trains: {train_count} | {DEVICE}",
-            (10, 30),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.7,
-            (255, 255, 255),
-            2
-        )
-
         # показываем кадр в Streamlit
         frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         video_placeholder.image(frame_rgb, use_container_width=True)
@@ -575,10 +620,17 @@ def run_dashboard():
         # таблица поездов
         if trains_out:
             df_trains = pd.DataFrame(trains_out)
-            styled_trains = df_trains.style.set_properties(**{
-                'max-width': '300px',
-                'font-size': '12px'
-            }, subset=['History'])
+
+            # Стилизация для статусов поездов
+            def color_train_status(val):
+                if val == "Arrived":
+                    return 'color: #28a745; font-weight: bold;'
+                elif val == "Departed":
+                    return 'color: #dc3545; font-weight: bold;'
+                else:
+                    return ''
+
+            styled_trains = df_trains.style.map(color_train_status, subset=['Status'])
             trains_placeholder.dataframe(styled_trains, hide_index=True, use_container_width=True)
         else:
             trains_placeholder.write("Нет активных поездов")
@@ -587,14 +639,17 @@ def run_dashboard():
     st.write("Видео закончилось, обработка завершена.")
 
     # Вывод полной истории действий перед завершением
-    st.subheader("Полная история действий")
-    all_ids = list(action_history.history.keys())
-    for obj_id in all_ids:
-        st.write(f"**{obj_id}**:")
-        history = action_history.get_action_history(obj_id)
-        for record in history:
-            st.write(
-                f"  - {record['timestamp'].strftime('%H:%M:%S')}: {record['action']} (длительность: {record['duration'].total_seconds():.1f}с)")
+    st.subheader("Полная история поездов")
+    all_train_ids = [obj_id for obj_id in action_history.history.keys() if obj_id.startswith('T')]
+    for train_id in all_train_ids:
+        arrival = action_history.get_arrival_time(train_id)
+        departure = action_history.get_departure_time(train_id)
+
+        st.write(f"**{train_id}**:")
+        if arrival:
+            st.write(f"  - Прибыл: {arrival.strftime('%H:%M:%S')}")
+        if departure:
+            st.write(f"  - Уехал: {departure.strftime('%H:%M:%S')}")
 
     db_queue.join()
     db_queue.put(None)
