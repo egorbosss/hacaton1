@@ -2,4 +2,7 @@
 
 Запуск программы с бордом: 
 
-    python -m streamlit run main.py 
+    python -m streamlit run main.py
+
+    или
+    py -m streamlit run main.py

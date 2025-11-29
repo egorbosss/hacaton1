@@ -11,15 +11,15 @@ from db import SessionLocal, Detection, reset_db
 # next for gui
 import streamlit as st
 import pandas as pd
-from datetime import datetime
+from datetime import datetime, timedelta
 
-#____Очистка таблицы при старте программы____
+# ____Очистка таблицы при старте программы____
 session = SessionLocal()
 session.query(Detection).delete()
 session.commit()
 session.close()
 print("[DB] drop OK")
-#_____________________________________________
+# _____________________________________________
 
 # ---- выбор устройства ----
 if torch.cuda.is_available():
@@ -44,6 +44,7 @@ PERSON_CONF_THRESHOLD = 0.4
 TRAIN_CONF_THRESHOLD = 0.7
 MIN_TRAIN_REL_HEIGHT = 0.2
 TRAIN_RESET_FRAMES = 200
+
 
 # --------------------------------------------------
 # Уменьшение FPS исходного видео
@@ -113,6 +114,7 @@ model = YOLO(MODEL_PATH)
 # --------------------------------------------------
 db_queue = queue.Queue()
 
+
 def db_worker():
     """Фоновый поток: забирает данные из очереди и пишет их в БД."""
     session = SessionLocal()
@@ -142,6 +144,7 @@ def db_worker():
             db_queue.task_done()
 
     session.close()
+
 
 db_thread = threading.Thread(target=db_worker, daemon=True)
 db_thread.start()
@@ -224,6 +227,63 @@ def get_object_type(class_id):
 
 
 # --------------------------------------------------
+#  СИСТЕМА ЗАПОМИНАНИЯ ВРЕМЕНИ ДЕЙСТВИЙ
+# --------------------------------------------------
+class ActionHistory:
+    def __init__(self, max_history_per_id=50):
+        self.history = collections.defaultdict(lambda: collections.deque(maxlen=max_history_per_id))
+        self.last_actions = {}  # последнее действие для каждого ID
+
+    def record_action(self, obj_id, action, timestamp):
+        """Записывает действие с временной меткой"""
+        # Если действие изменилось, записываем новую запись
+        if obj_id not in self.last_actions or self.last_actions[obj_id] != action:
+            self.history[obj_id].append({
+                "action": action,
+                "timestamp": timestamp,
+                "duration": timedelta(0)  # начальная длительность
+            })
+            self.last_actions[obj_id] = action
+
+        # Обновляем длительность текущего действия
+        if self.history[obj_id]:
+            current_record = self.history[obj_id][-1]
+            if current_record["action"] == action:
+                current_record["duration"] = timestamp - current_record["timestamp"]
+
+    def get_action_history(self, obj_id):
+        """Возвращает историю действий для объекта"""
+        return list(self.history[obj_id])
+
+    def get_current_action(self, obj_id):
+        """Возвращает текущее действие объекта"""
+        return self.last_actions.get(obj_id, "Unknown")
+
+    def get_current_action_with_duration(self, obj_id):
+        """Возвращает текущее действие с длительностью"""
+        if obj_id in self.last_actions and self.history[obj_id]:
+            current = self.history[obj_id][-1]
+            duration_seconds = current["duration"].total_seconds()
+            return f"{current['action']} ({duration_seconds:.1f}s)"
+        return "Unknown"
+
+    def get_recent_actions_summary(self, obj_id, max_actions=3):
+        """Возвращает краткую сводку последних действий"""
+        history = self.get_action_history(obj_id)
+        if not history:
+            return "No history"
+
+        recent = list(history)[-max_actions:]
+        summary = []
+        for record in recent:
+            duration_str = f"{record['duration'].total_seconds():.1f}s"
+            time_str = record["timestamp"].strftime("%H:%M:%S")
+            summary.append(f"{record['action']} ({duration_str}) at {time_str}")
+
+        return " → ".join(summary)
+
+
+# --------------------------------------------------
 #  ФУНКЦИЯ ДАШБОРДА (YOLO + STREAMLIT)
 # --------------------------------------------------
 def run_dashboard():
@@ -271,6 +331,10 @@ def run_dashboard():
         text-align: center;
         color: #0e0f10
     }
+    .history-cell {
+        max-width: 300px;
+        font-size: 12px;
+    }
     </style>
     """, unsafe_allow_html=True)
 
@@ -303,6 +367,9 @@ def run_dashboard():
     main_train_id = None
     frame_idx = 0
 
+    # Инициализация системы запоминания действий
+    action_history = ActionHistory()
+
     st.write("Загружаю модель YOLO…")
     # модель уже загружена глобально: model
 
@@ -329,8 +396,11 @@ def run_dashboard():
         frame = result.orig_img.copy()
         frame_h = frame.shape[0]
 
+        # Текущее время для записи действий
+        current_time = datetime.now()
+
         # время
-        now = datetime.now().strftime("%H:%M")
+        now = current_time.strftime("%H:%M")
         time_placeholder.markdown(f'<div class="big-time">{now}</div>', unsafe_allow_html=True)
 
         # сброс главного поезда
@@ -411,9 +481,16 @@ def run_dashboard():
                     action = analyze_train_movement(position_history[global_id], size_history[global_id])
                     color = (0, 255, 255)
                     label = f"Train {global_id}: {action}"
+
+                    # Записываем действие с временем
+                    action_history.record_action(global_id, action, current_time)
+
                     trains_out.append({
                         "ID": global_id,
-                        "Action": action,
+                        "Action": action_history.get_current_action_with_duration(global_id),
+                        "History": action_history.get_recent_actions_summary(global_id),
+                        "First Seen": action_history.get_action_history(global_id)[0]["timestamp"].strftime(
+                            "%H:%M:%S") if action_history.get_action_history(global_id) else "N/A",
                         "Frame": frame_idx
                     })
                 else:
@@ -422,9 +499,16 @@ def run_dashboard():
                     action = f"{movement_action} ({size_action})"
                     color = (0, 255, 0)
                     label = f"Person {global_id}: {action}"
+
+                    # Записываем действие с временем
+                    action_history.record_action(global_id, action, current_time)
+
                     people_out.append({
                         "ID": global_id,
-                        "Action": action,
+                        "Action": action_history.get_current_action_with_duration(global_id),
+                        "History": action_history.get_recent_actions_summary(global_id),
+                        "First Seen": action_history.get_action_history(global_id)[0]["timestamp"].strftime(
+                            "%H:%M:%S") if action_history.get_action_history(global_id) else "N/A",
                         "Frame": frame_idx
                     })
 
@@ -479,19 +563,39 @@ def run_dashboard():
         # таблица людей
         if people_out:
             df_people = pd.DataFrame(people_out)
-            people_placeholder.dataframe(df_people, hide_index=True, use_container_width=True)
+            # Стилизация для лучшего отображения истории
+            styled_people = df_people.style.set_properties(**{
+                'max-width': '300px',
+                'font-size': '12px'
+            }, subset=['History'])
+            people_placeholder.dataframe(styled_people, hide_index=True, use_container_width=True)
         else:
             people_placeholder.write("Нет активных людей")
 
         # таблица поездов
         if trains_out:
             df_trains = pd.DataFrame(trains_out)
-            trains_placeholder.dataframe(df_trains, hide_index=True, use_container_width=True)
+            styled_trains = df_trains.style.set_properties(**{
+                'max-width': '300px',
+                'font-size': '12px'
+            }, subset=['History'])
+            trains_placeholder.dataframe(styled_trains, hide_index=True, use_container_width=True)
         else:
             trains_placeholder.write("Нет активных поездов")
 
     # когда видео закончится
     st.write("Видео закончилось, обработка завершена.")
+
+    # Вывод полной истории действий перед завершением
+    st.subheader("Полная история действий")
+    all_ids = list(action_history.history.keys())
+    for obj_id in all_ids:
+        st.write(f"**{obj_id}**:")
+        history = action_history.get_action_history(obj_id)
+        for record in history:
+            st.write(
+                f"  - {record['timestamp'].strftime('%H:%M:%S')}: {record['action']} (длительность: {record['duration'].total_seconds():.1f}с)")
+
     db_queue.join()
     db_queue.put(None)
     db_thread.join()
