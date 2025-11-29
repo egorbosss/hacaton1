@@ -10,6 +10,11 @@ from datetime import datetime, timedelta
 import streamlit as st
 import pandas as pd
 
+try:
+    import pytesseract
+except ImportError:
+    pytesseract = None
+
 from db import SessionLocal, Detection
 
 
@@ -393,6 +398,28 @@ def setup_streamlit_ui():
     return time_placeholder, video_placeholder, people_placeholder, trains_placeholder
 
 
+def extract_video_start_time(frame):
+    if pytesseract is None:
+        return None
+
+    h, w, _ = frame.shape
+    roi = frame[0:int(h * 0.12), 0:int(w * 0.55)]
+    gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+    gray = cv2.GaussianBlur(gray, (3, 3), 0)
+    _, thresh = cv2.threshold(gray, 180, 255, cv2.THRESH_BINARY)
+
+    config = "--psm 7 -c tessedit_char_whitelist=0123456789:- "
+    text = pytesseract.image_to_string(thresh, config=config).strip()
+
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%H:%M:%S", "%H:%M"):
+        try:
+            return datetime.strptime(text, fmt)
+        except ValueError:
+            continue
+
+    return None
+
+
 def run_dashboard():
     time_placeholder, video_placeholder, people_placeholder, trains_placeholder = setup_streamlit_ui()
 
@@ -411,6 +438,17 @@ def run_dashboard():
     frame_idx = 0
 
     action_history = ActionHistory()
+
+    cap = cv2.VideoCapture(VIDEO_PATH)
+    ret, first_frame = cap.read()
+    cap.release()
+    if ret:
+        video_start_time = extract_video_start_time(first_frame)
+    else:
+        video_start_time = None
+
+    if video_start_time is None:
+        video_start_time = datetime.now()
 
     model = YOLO(MODEL_PATH)
 
@@ -434,9 +472,11 @@ def run_dashboard():
         frame = result.orig_img.copy()
         frame_h = frame.shape[0]
 
-        now = datetime.now()
+        elapsed_seconds = (frame_idx - 1) * YOLO_VID_STRIDE / VIDEO_FPS
+        frame_time = video_start_time + timedelta(seconds=elapsed_seconds)
+
         time_placeholder.markdown(
-            f'<div class="big-time">{now.strftime("%H:%M")}</div>',
+            f'<div class="big-time">{frame_time.strftime("%H:%M:%S")}</div>',
             unsafe_allow_html=True,
         )
 
@@ -514,7 +554,7 @@ def run_dashboard():
                     color = (0, 255, 255)
                     label = f"Train {global_id}: {action}"
 
-                    action_history.record_action(global_id, action, now)
+                    action_history.record_action(global_id, action, frame_time)
 
                     arrival_str = format_time(action_history.get_arrival_time(global_id))
                     departure_str = format_time(action_history.get_departure_time(global_id))
@@ -537,7 +577,7 @@ def run_dashboard():
                     color = (0, 255, 0)
                     label = f"Person {global_id}: {action}"
 
-                    action_history.record_action(global_id, action, now)
+                    action_history.record_action(global_id, action, frame_time)
 
                     first_seen_time = action_history.get_first_seen_time(global_id)
                     first_seen_str = format_time(first_seen_time) if first_seen_time else "N/A"
