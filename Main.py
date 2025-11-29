@@ -461,8 +461,8 @@ def run_dashboard():
         persist=True,
         device=DEVICE,
         imgsz=YOLO_IMGSZ,
-        conf=0.25,
-        iou=0.5,
+        conf=0.35,
+        iou=0.2,
         vid_stride=YOLO_VID_STRIDE,
         verbose=False,
     )
