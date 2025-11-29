@@ -1,352 +1,346 @@
 from ultralytics import YOLO
 import cv2
-import os
 import collections
 import math
 import torch
-from sqlalchemy import Column, Integer, String, Float
 import queue
 import threading
-from db import SessionLocal, Detection, reset_db
-# next for gui
-import streamlit as st
-import pandas as pd
 from datetime import datetime, timedelta
 
-# ____Очистка таблицы при старте программы____
-session = SessionLocal()
-session.query(Detection).delete()
-session.commit()
-session.close()
-print("[DB] drop OK")
-# _____________________________________________
+import streamlit as st
+import pandas as pd
 
-# ---- выбор устройства ----
-if torch.cuda.is_available():
-    DEVICE = "cuda"
-elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-    DEVICE = "mps"
-else:
-    DEVICE = "cpu"
+from db import SessionLocal, Detection
 
-print(f"Using device: {DEVICE}")
+
+def get_device():
+    if torch.cuda.is_available():
+        return "cuda"
+    if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+        return "mps"
+    return "cpu"
+
+
+DEVICE = get_device()
 
 VIDEO_PATH = "videos/video.mp4"
 MODEL_PATH = "yolo11x.pt"
-train_arrived = False
 
-MAX_FRAME_GAP = 10 ** 10
+with SessionLocal() as s:
+    s.query(Detection).delete()
+    s.commit()
+
+FRAME_HEIGHT = 720
+
+YOLO_IMGSZ = 960
+YOLO_VID_STRIDE = 2
+
+VIDEO_FPS = 20
+EFFECTIVE_FPS = VIDEO_FPS / YOLO_VID_STRIDE
+
+POSITION_HISTORY_LEN = 30
+SIZE_HISTORY_LEN = 30
+
 MAX_REID_DISTANCE = 80
 SEND_EVERY_N_FRAMES = 50
-VID_STRIDE = 2
 
-PERSON_CONF_THRESHOLD = 0.4
+CLASS_PERSON = 0
+CLASS_TRAIN = 6
+
+PERSON_CONF_THRESHOLD = 0.25
+PERSON_CONF_THRESHOLD_NEAR = 0.15
+PERSON_LOCAL_RADIUS = 100.0
+PERSON_LOCAL_MAX_FRAME_GAP = 10
+
+FRAME_GAP = {
+    CLASS_PERSON: 60,
+    CLASS_TRAIN: 120,
+}
+MISSED_FRAMES = {
+    CLASS_PERSON: 20,
+    CLASS_TRAIN: 60,
+}
+
+PERSON_STANDING_SPEED = FRAME_HEIGHT * 0.02
+PERSON_WALK_SLOW_SPEED = FRAME_HEIGHT * 0.08
+PERSON_WALK_SPEED = FRAME_HEIGHT * 0.2
+
 TRAIN_CONF_THRESHOLD = 0.7
 MIN_TRAIN_REL_HEIGHT = 0.2
 TRAIN_RESET_FRAMES = 200
 
+K_REID = {
+    CLASS_PERSON: 0.6,
+    CLASS_TRAIN: 1.2,
+}
 
-# --------------------------------------------------
-# Уменьшение FPS исходного видео
-# --------------------------------------------------
-def ensure_20_fps(video_path: str, target_fps: int = 5) -> str:
-    # базовое имя + расширение
-    base, ext = os.path.splitext(video_path)
-    if ext == "":
-        ext = ".mp4"
+ACTION_STABLE_FRAMES = 5
 
-    # имя файла с нужным fps, например video_fps15.mp4
-    out_path = f"{base}_fps{target_fps}{ext}"
-
-    # 1) если уже есть перерасчитанное видео — просто используем его
-    if os.path.exists(out_path):
-        print(f"[FPS] найден уже пережатый файл: {out_path}, повторное сжатие не требуется")
-        return out_path
-
-    # 2) иначе — как раньше, считаем fps и при необходимости пережимаем
-    cap = cv2.VideoCapture(video_path)
-    if not cap.isOpened():
-        print("Не удалось открыть видео:", video_path)
-        return video_path
-
-    orig_fps = cap.get(cv2.CAP_PROP_FPS) or 0
-    if orig_fps <= 0:
-        cap.release()
-        return video_path
-
-    if orig_fps <= target_fps:
-        cap.release()
-        print(f"FPS видео {orig_fps:.2f} <= {target_fps}, перерасчет не нужен")
-        return video_path
-
-    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-
-    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-    out = cv2.VideoWriter(out_path, fourcc, target_fps, (width, height))
-
-    ratio = orig_fps / target_fps
-    acc = 0.0
-
-    while True:
-        ret, frame = cap.read()
-        if not ret:
-            break
-        acc += 1.0
-        if acc >= ratio:
-            out.write(frame)
-            acc -= ratio
-
-    cap.release()
-    out.release()
-
-    print(f"Видео снижено с {orig_fps:.2f} до {target_fps} fps: {out_path}")
-    return out_path
-
-
-PROCESSED_VIDEO_PATH = ensure_20_fps(VIDEO_PATH)
-
-# ---- модель YOLO ----
-model = YOLO(MODEL_PATH)
-
-# --------------------------------------------------
-#  DB: очередь + поток
-# --------------------------------------------------
 db_queue = queue.Queue()
 
 
+def format_time(dt):
+    if dt is None:
+        return "--:--:--"
+    return dt.strftime("%H:%M:%S")
+
+
 def db_worker():
-    """Фоновый поток: забирает данные из очереди и пишет их в БД."""
     session = SessionLocal()
-    while True:
-        item = db_queue.get()
-        if item is None:
-            break  # сигнал на завершение
-
-        try:
-            raw_pid = str(item["person_id"])
-            pid = int(''.join(ch for ch in raw_pid if ch.isdigit()))
-
-            det = Detection(
-                person_id=pid,
-                frame=item["frame"],
-                action=item["action"],
-                x=item["x"],
-                y=item["y"],
-            )
-            session.add(det)
-            session.commit()
-            # print(f"[DB] saved: person_id={pid}, frame={item['frame']}, action={item['action']}")
-        except Exception as e:
-            session.rollback()
-            print("DB error:", e)
-        finally:
-            db_queue.task_done()
-
-    session.close()
+    try:
+        while True:
+            item = db_queue.get()
+            if item is None:
+                break
+            try:
+                raw_pid = str(item["person_id"])
+                pid = int("".join(ch for ch in raw_pid if ch.isdigit()))
+                det = Detection(
+                    person_id=pid,
+                    frame=item["frame"],
+                    action=item["action"],
+                    x=item["x"],
+                    y=item["y"],
+                )
+                session.add(det)
+                session.commit()
+            except Exception:
+                session.rollback()
+            finally:
+                db_queue.task_done()
+    finally:
+        session.close()
 
 
 db_thread = threading.Thread(target=db_worker, daemon=True)
 db_thread.start()
 
 
-# --------------------------------------------------
-#  ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ АНАЛИЗА
-# --------------------------------------------------
-def analyze_person_movement(positions):
+def analyze_person_movement(positions, fps):
     if len(positions) < 2:
         return "Standing"
-    first_x, first_y = positions[0]
-    last_x, last_y = positions[-1]
-    dist = math.hypot(last_x - first_x, last_y - first_y)
-    if dist < 5:
+
+    pts = list(positions)
+    dist = 0.0
+    for (x0, y0), (x1, y1) in zip(pts[:-1], pts[1:]):
+        dist += math.hypot(x1 - x0, y1 - y0)
+
+    time_s = (len(pts) - 1) / fps
+    speed = dist / max(time_s, 1e-3)
+
+    if speed < PERSON_STANDING_SPEED:
         return "Standing"
-    elif dist < 20:
+    if speed < PERSON_WALK_SLOW_SPEED:
         return "Walking slowly"
-    elif dist < 50:
+    if speed < PERSON_WALK_SPEED:
         return "Walking"
-    else:
-        return "Moving fast"
+    return "Moving fast"
 
 
 def analyze_train_movement(positions, sizes):
     if len(positions) < 3:
         return "Stopped"
 
-    first_x, first_y = positions[0]
-    last_x, last_y = positions[-1]
-    dist = math.hypot(last_x - first_x, last_y - first_y)
-    steps = max(len(positions) - 1, 1)
-    avg_step = dist / steps
+    x0, y0 = positions[0]
+    x1, y1 = positions[-1]
+    dist = math.hypot(x1 - x0, y1 - y0)
+    steps = len(positions) - 1
+    avg_step = dist / max(steps, 1)
 
     rel_size_change = 0.0
     if len(sizes) >= 2 and sizes[0] > 0:
-        first_size = sizes[0]
-        last_size = sizes[-1]
-        rel_size_change = (last_size - first_size) / first_size
+        s0 = sizes[0]
+        s1 = sizes[-1]
+        rel_size_change = (s1 - s0) / s0
 
-    # Упрощенная логика: только прибыл или уехал
     if rel_size_change > 0.05:
         return "Arrived"
-    elif rel_size_change < -0.05:
+    if rel_size_change < -0.05:
         return "Departed"
-    elif avg_step < 0.3 and abs(rel_size_change) < 0.02:
+    if avg_step < 0.3 and abs(rel_size_change) < 0.02:
         return "Stopped"
-    else:
-        return "Stopped"
+    return "Stopped"
 
 
-def find_matching_global_id(center, frame_idx, obj_class, global_state):
+def find_matching_global_id(center, bbox_height, frame_idx, obj_class, global_state):
     best_gid = None
     best_dist = None
-    for gid, st in global_state.items():
-        if st["class"] != obj_class:
+    best_gap = None
+
+    cx, cy = center
+    max_gap = FRAME_GAP.get(obj_class, FRAME_GAP[CLASS_PERSON])
+    k_reid = K_REID.get(obj_class, K_REID[CLASS_PERSON])
+    max_reid_dist = min(MAX_REID_DISTANCE, k_reid * bbox_height)
+
+    for gid, st_state in global_state.items():
+        if st_state["class"] != obj_class:
             continue
-        if frame_idx - st["last_frame"] > MAX_FRAME_GAP:
+
+        frame_gap = frame_idx - st_state["last_frame"]
+        if frame_gap > max_gap or frame_gap < 0:
             continue
-        lx, ly = st["last_pos"]
-        dist = math.hypot(center[0] - lx, center[1] - ly)
-        if best_dist is None or dist < best_dist:
+
+        lx, ly = st_state["last_pos"]
+        dist = math.hypot(cx - lx, cy - ly)
+        if dist > max_reid_dist:
+            continue
+
+        if best_dist is None:
             best_dist = dist
             best_gid = gid
+            best_gap = frame_gap
+            continue
 
-    if best_gid is not None and best_dist <= MAX_REID_DISTANCE:
-        return best_gid
-    return None
+        if dist < best_dist:
+            best_dist = dist
+            best_gid = gid
+            best_gap = frame_gap
+        else:
+            if abs(dist - best_dist) <= 0.1 * max(best_dist, 1e-6) and frame_gap < best_gap:
+                best_gid = gid
+                best_dist = dist
+                best_gap = frame_gap
+
+    return best_gid
 
 
-def get_object_type(class_id):
-    if class_id == 0:
-        return "person"
-    elif class_id == 6:
-        return "train"
-    else:
-        return f"class_{class_id}"
+def get_person_conf_threshold(center, frame_idx, global_state):
+    best_dist = None
+
+    cx, cy = center
+    for st_state in global_state.values():
+        if st_state["class"] != CLASS_PERSON:
+            continue
+
+        frame_gap = frame_idx - st_state["last_frame"]
+        if frame_gap > PERSON_LOCAL_MAX_FRAME_GAP or frame_gap < 0:
+            continue
+
+        lx, ly = st_state["last_pos"]
+        dist = math.hypot(cx - lx, cy - ly)
+
+        if best_dist is None or dist < best_dist:
+            best_dist = dist
+
+    if best_dist is not None and best_dist <= PERSON_LOCAL_RADIUS:
+        return PERSON_CONF_THRESHOLD_NEAR
+    return PERSON_CONF_THRESHOLD
 
 
-# --------------------------------------------------
-#  СИСТЕМА ЗАПОМИНАНИЯ ВРЕМЕНИ ДЕЙСТВИЙ
-# --------------------------------------------------
 class ActionHistory:
-    def __init__(self, max_history_per_id=50):
-        self.history = collections.defaultdict(lambda: collections.deque(maxlen=max_history_per_id))
-        self.last_actions = {}  # последнее действие для каждого ID
-        self.arrival_times = {}  # время прибытия для поездов
-        self.departure_times = {}  # время отправления для поездов
+    def __init__(self, max_history_per_id=50, stable_frames=ACTION_STABLE_FRAMES):
+        self.history = collections.defaultdict(
+            lambda: collections.deque(maxlen=max_history_per_id)
+        )
+        self.last_actions = {}
+        self.arrival_times = {}
+        self.departure_times = {}
+        self.stable_frames = stable_frames
+        self._pending = collections.defaultdict(
+            lambda: {"candidate": None, "count": 0}
+        )
 
-    def record_action(self, obj_id, action, timestamp):
-        """Записывает действие с временной меткой"""
-        # Для поездов сохраняем время прибытия и отправления
-        if obj_id.startswith('T'):  # Это поезд
-            if action == "Arrived" and obj_id not in self.arrival_times:
-                self.arrival_times[obj_id] = timestamp
-            elif action == "Departed" and obj_id not in self.departure_times:
-                self.departure_times[obj_id] = timestamp
+    def _apply_train_events(self, obj_id, action, timestamp):
+        if not obj_id.startswith("T"):
+            return
+        if action == "Arrived" and obj_id not in self.arrival_times:
+            self.arrival_times[obj_id] = timestamp
+        elif action == "Departed" and obj_id not in self.departure_times:
+            self.departure_times[obj_id] = timestamp
 
-        # Если действие изменилось, записываем новую запись
-        if obj_id not in self.last_actions or self.last_actions[obj_id] != action:
-            self.history[obj_id].append({
-                "action": action,
-                "timestamp": timestamp,
-                "duration": timedelta(0)  # начальная длительность
-            })
-            self.last_actions[obj_id] = action
+    def record_action(self, obj_id, raw_action, timestamp):
+        current = self.last_actions.get(obj_id)
 
-        # Обновляем длительность текущего действия
-        if self.history[obj_id]:
+        if current is None:
+            self.last_actions[obj_id] = raw_action
+            self.history[obj_id].append(
+                {
+                    "action": raw_action,
+                    "timestamp": timestamp,
+                    "duration": timedelta(0),
+                }
+            )
+            self._apply_train_events(obj_id, raw_action, timestamp)
+        else:
+            if raw_action == current:
+                pending = self._pending[obj_id]
+                pending["candidate"] = None
+                pending["count"] = 0
+            else:
+                pending = self._pending[obj_id]
+                if pending["candidate"] == raw_action:
+                    pending["count"] += 1
+                else:
+                    pending["candidate"] = raw_action
+                    pending["count"] = 1
+
+                if pending["count"] >= self.stable_frames:
+                    self.last_actions[obj_id] = raw_action
+                    self.history[obj_id].append(
+                        {
+                            "action": raw_action,
+                            "timestamp": timestamp,
+                            "duration": timedelta(0),
+                        }
+                    )
+                    self._apply_train_events(obj_id, raw_action, timestamp)
+                    pending["candidate"] = None
+                    pending["count"] = 0
+
+        if obj_id in self.last_actions and self.history[obj_id]:
+            accepted_action = self.last_actions[obj_id]
             current_record = self.history[obj_id][-1]
-            if current_record["action"] == action:
+            if current_record["action"] == accepted_action:
                 current_record["duration"] = timestamp - current_record["timestamp"]
 
     def get_arrival_time(self, obj_id):
-        """Возвращает время прибытия поезда"""
         return self.arrival_times.get(obj_id)
 
     def get_departure_time(self, obj_id):
-        """Возвращает время отправления поезда"""
         return self.departure_times.get(obj_id)
 
-    def get_action_history(self, obj_id):
-        """Возвращает историю действий для объекта"""
-        return list(self.history[obj_id])
-
-    def get_current_action(self, obj_id):
-        """Возвращает текущее действие объекта"""
-        return self.last_actions.get(obj_id, "Unknown")
+    def get_first_seen_time(self, obj_id):
+        hist = self.history.get(obj_id)
+        if not hist:
+            return None
+        return hist[0]["timestamp"]
 
     def get_current_action_with_duration(self, obj_id):
-        """Возвращает текущее действие с длительностью"""
-        if obj_id in self.last_actions and self.history[obj_id]:
-            current = self.history[obj_id][-1]
-            duration_seconds = current["duration"].total_seconds()
-            return f"{current['action']} ({duration_seconds:.1f}s)"
+        hist = self.history.get(obj_id)
+        if obj_id in self.last_actions and hist:
+            current = hist[-1]
+            seconds = current["duration"].total_seconds()
+            return f"{current['action']} ({seconds:.1f}s)"
         return "Unknown"
 
-    def get_train_status_summary(self, obj_id):
-        """Возвращает сводку статуса поезда с временем прибытия/отправления"""
-        if not obj_id.startswith('T'):
-            return "Not a train"
-
-        arrival = self.get_arrival_time(obj_id)
-        departure = self.get_departure_time(obj_id)
-        current_action = self.get_current_action(obj_id)
-
-        status_parts = []
-
-        if arrival:
-            status_parts.append(f"Прибыл: {arrival.strftime('%H:%M:%S')}")
-        else:
-            status_parts.append("Прибыл: --:--:--")
-
-        if departure:
-            status_parts.append(f"Уехал: {departure.strftime('%H:%M:%S')}")
-        else:
-            status_parts.append("Уехал: --:--:--")
-
-        return " | ".join(status_parts)
-
     def get_recent_actions_summary(self, obj_id, max_actions=3):
-        """Возвращает краткую сводку последних действий"""
-        # Для поездов показываем статус с временем
-        if obj_id.startswith('T'):
-            return self.get_train_status_summary(obj_id)
-
-        # Для людей - обычная история действий
-        history = self.get_action_history(obj_id)
-        if not history:
+        hist = self.history.get(obj_id)
+        if not hist:
             return "No history"
 
-        recent = list(history)[-max_actions:]
-        summary = []
+        recent = list(hist)[-max_actions:]
+        summary_parts = []
         for record in recent:
             duration_str = f"{record['duration'].total_seconds():.1f}s"
             time_str = record["timestamp"].strftime("%H:%M:%S")
-            summary.append(f"{record['action']} ({duration_str}) at {time_str}")
+            summary_parts.append(f"{record['action']} ({duration_str}) at {time_str}")
+        return " → ".join(summary_parts)
 
-        return " → ".join(summary)
 
-
-# --------------------------------------------------
-#  ФУНКЦИЯ ДАШБОРДА (YOLO + STREAMLIT)
-# --------------------------------------------------
-def run_dashboard():
-    """
-    Запускает дашборд со стримом видео и таблицами людей/поездов.
-    Запуск: streamlit run Main.py
-    """
-    # ----- ОФОРМЛЕНИЕ СТРАНИЦЫ -----
+def setup_streamlit_ui():
     st.set_page_config(page_title="DFN – СИБИНТЕК", layout="wide")
 
-    st.markdown("""
+    st.markdown(
+        """
     <style>
     p {
-            color: #201600;
+        color: #201600;
     }
     .stMainBlockContainer {
-            background-color: #ffffff;
+        background-color: #ffffff;
     }
     .stMain {
-            background-color: #ffffff;
+        background-color: #ffffff;
     }
     .block-yellow {
         background-color: #f6ce45;
@@ -374,31 +368,17 @@ def run_dashboard():
         text-align: center;
         color: #0e0f10
     }
-    .history-cell {
-        max-width: 300px;
-        font-size: 12px;
-    }
-    .train-status {
-        font-size: 14px;
-        font-weight: bold;
-    }
-    .arrived {
-        color: #28a745;
-    }
-    .departed {
-        color: #dc3545;
-    }
     </style>
-    """, unsafe_allow_html=True)
+    """,
+        unsafe_allow_html=True,
+    )
 
-    # верхняя строка – время
-    top_left, top_center, top_right = st.columns([2, 3, 1])
+    top_left, top_center, _ = st.columns([2, 3, 1])
     with top_center:
         time_placeholder = st.empty()
     with top_left:
         st.image("static/logo.svg", width=200)
 
-    # основная сетка
     video_col, people_col, train_col = st.columns([3, 2, 2])
     video_placeholder = video_col.empty()
 
@@ -410,9 +390,19 @@ def run_dashboard():
         st.markdown('<div class="block-dark">ПОЕЗДА</div>', unsafe_allow_html=True)
         trains_placeholder = st.empty()
 
-    # ----- ЛОКАЛЬНЫЕ СТРУКТУРЫ ТРЕКИНГА -----
-    position_history = collections.defaultdict(lambda: collections.deque(maxlen=10))
-    size_history = collections.defaultdict(lambda: collections.deque(maxlen=10))
+    return time_placeholder, video_placeholder, people_placeholder, trains_placeholder
+
+
+def run_dashboard():
+    time_placeholder, video_placeholder, people_placeholder, trains_placeholder = setup_streamlit_ui()
+
+    position_history = collections.defaultdict(
+        lambda: collections.deque(maxlen=POSITION_HISTORY_LEN)
+    )
+    size_history = collections.defaultdict(
+        lambda: collections.deque(maxlen=SIZE_HISTORY_LEN)
+    )
+
     trackid_to_global = {}
     global_state = {}
     next_person_id = 1
@@ -420,43 +410,36 @@ def run_dashboard():
     main_train_id = None
     frame_idx = 0
 
-    # Инициализация системы запоминания действий
     action_history = ActionHistory()
 
-    st.write("Загружаю модель YOLO…")
-    # модель уже загружена глобально: model
-
-    st.write("Запускаю трекинг видео…")
+    model = YOLO(MODEL_PATH)
 
     results = model.track(
-        source=PROCESSED_VIDEO_PATH,
+        source=VIDEO_PATH,
         stream=True,
         show=False,
         tracker="bytetrack.yaml",
-        classes=[0, 6],
+        classes=[CLASS_PERSON, CLASS_TRAIN],
         persist=True,
         device=DEVICE,
-        imgsz=1080,
-        conf=0.5,
+        imgsz=YOLO_IMGSZ,
+        conf=0.25,
         iou=0.5,
-        vid_stride=VID_STRIDE,
-        verbose=False
+        vid_stride=YOLO_VID_STRIDE,
+        verbose=False,
     )
 
-    # ----- ГЛАВНЫЙ ЦИКЛ -----
     for result in results:
         frame_idx += 1
         frame = result.orig_img.copy()
         frame_h = frame.shape[0]
 
-        # Текущее время для записи действий
-        current_time = datetime.now()
+        now = datetime.now()
+        time_placeholder.markdown(
+            f'<div class="big-time">{now.strftime("%H:%M")}</div>',
+            unsafe_allow_html=True,
+        )
 
-        # время
-        now = current_time.strftime("%H:%M")
-        time_placeholder.markdown(f'<div class="big-time">{now}</div>', unsafe_allow_html=True)
-
-        # сброс главного поезда
         if main_train_id is not None:
             st_train = global_state.get(main_train_id)
             if st_train is None or frame_idx - st_train["last_frame"] > TRAIN_RESET_FRAMES:
@@ -472,55 +455,49 @@ def run_dashboard():
 
                 try:
                     track_id = int(box.id)
-                except:
+                except Exception:
                     track_id = int(box.id.item())
 
-                bbox = box.xyxy[0].cpu().numpy()
-                x1, y1, x2, y2 = bbox
+                x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()
                 cx = (x1 + x2) / 2
                 cy = (y1 + y2) / 2
                 center = (cx, cy)
 
                 obj_class = int(box.cls.item())
-                obj_type = get_object_type(obj_class)
-                bbox_height = y2 - y1
+                bbox_height = float(y2 - y1)
                 conf_score = float(box.conf.item())
 
-                # фильтры
-                if obj_class == 0:
-                    if conf_score < PERSON_CONF_THRESHOLD:
+                if obj_class == CLASS_PERSON:
+                    local_thr = get_person_conf_threshold(center, frame_idx, global_state)
+                    if conf_score < local_thr:
                         continue
-                elif obj_class == 6:
+                elif obj_class == CLASS_TRAIN:
                     rel_h = bbox_height / frame_h
-                    if conf_score < TRAIN_CONF_THRESHOLD:
-                        continue
-                    if rel_h < MIN_TRAIN_REL_HEIGHT:
+                    if conf_score < TRAIN_CONF_THRESHOLD or rel_h < MIN_TRAIN_REL_HEIGHT:
                         continue
                 else:
                     continue
 
-                # track_id -> global_id
                 if track_id in trackid_to_global:
                     global_id = trackid_to_global[track_id]
                 else:
-                    match = find_matching_global_id(center, frame_idx, obj_class, global_state)
+                    match = find_matching_global_id(
+                        center, bbox_height, frame_idx, obj_class, global_state
+                    )
                     if match is not None:
                         global_id = match
                     else:
-                        if obj_class == 0:
+                        if obj_class == CLASS_PERSON:
                             global_id = f"P{next_person_id}"
                             next_person_id += 1
-                        elif obj_class == 6:
+                        elif obj_class == CLASS_TRAIN:
                             global_id = f"T{next_train_id}"
                             next_train_id += 1
                         else:
-                            global_id = f"O{next_person_id}"
-                            next_person_id += 1
-
+                            continue
                     trackid_to_global[track_id] = global_id
 
-                # главный поезд
-                if obj_class == 6:
+                if obj_class == CLASS_TRAIN:
                     if main_train_id is None:
                         main_train_id = global_id
                     elif global_id != main_train_id:
@@ -528,68 +505,72 @@ def run_dashboard():
 
                 position_history[global_id].append(center)
 
-                # действие
-                if obj_class == 6:
+                if obj_class == CLASS_TRAIN:
                     size_history[global_id].append(bbox_height)
-                    action = analyze_train_movement(position_history[global_id], size_history[global_id])
+                    action = analyze_train_movement(
+                        position_history[global_id],
+                        size_history[global_id],
+                    )
                     color = (0, 255, 255)
                     label = f"Train {global_id}: {action}"
 
-                    # Записываем действие с временем
-                    action_history.record_action(global_id, action, current_time)
+                    action_history.record_action(global_id, action, now)
 
-                    # Получаем время прибытия и отправления
-                    arrival_time = action_history.get_arrival_time(global_id)
-                    departure_time = action_history.get_departure_time(global_id)
+                    arrival_str = format_time(action_history.get_arrival_time(global_id))
+                    departure_str = format_time(action_history.get_departure_time(global_id))
 
-                    arrival_str = arrival_time.strftime("%H:%M:%S") if arrival_time else "--:--:--"
-                    departure_str = departure_time.strftime("%H:%M:%S") if departure_time else "--:--:--"
-
-                    trains_out.append({
-                        "ID": global_id,
-                        "Status": action,
-                        "Arrived": arrival_str,
-                        "Departed": departure_str,
-                        "Current Action": action_history.get_current_action_with_duration(global_id)
-                    })
+                    trains_out.append(
+                        {
+                            "ID": global_id,
+                            "Status": action,
+                            "Arrived": arrival_str,
+                            "Departed": departure_str,
+                            "Current Action": action_history.get_current_action_with_duration(global_id),
+                        }
+                    )
                 else:
-                    movement_action = analyze_person_movement(position_history[global_id])
+                    movement_action = analyze_person_movement(
+                        position_history[global_id], EFFECTIVE_FPS
+                    )
                     size_action = "Close" if bbox_height > frame_h * 0.4 else "Far"
                     action = f"{movement_action} ({size_action})"
                     color = (0, 255, 0)
                     label = f"Person {global_id}: {action}"
 
-                    # Записываем действие с временем
-                    action_history.record_action(global_id, action, current_time)
+                    action_history.record_action(global_id, action, now)
 
-                    people_out.append({
-                        "ID": global_id,
-                        "Action": action_history.get_current_action_with_duration(global_id),
-                        "History": action_history.get_recent_actions_summary(global_id),
-                        "First Seen": action_history.get_action_history(global_id)[0]["timestamp"].strftime(
-                            "%H:%M:%S") if action_history.get_action_history(global_id) else "N/A",
-                        "Frame": frame_idx
-                    })
+                    first_seen_time = action_history.get_first_seen_time(global_id)
+                    first_seen_str = format_time(first_seen_time) if first_seen_time else "N/A"
+
+                    people_out.append(
+                        {
+                            "ID": global_id,
+                            "Action": action_history.get_current_action_with_duration(global_id),
+                            "History": action_history.get_recent_actions_summary(global_id),
+                            "First Seen": first_seen_str,
+                            "Frame": frame_idx,
+                        }
+                    )
 
                 global_state[global_id] = {
                     "last_pos": center,
                     "last_frame": frame_idx,
                     "last_action": action,
                     "class": obj_class,
-                    "type": obj_type
+                    "bbox": (x1, y1, x2, y2),
                 }
 
-                # отправка в БД раз в N кадров (люди и поезда)
                 if frame_idx % SEND_EVERY_N_FRAMES == 10:
-                    db_queue.put({
-                        "person_id": str(global_id),
-                        "frame": int(frame_idx),
-                        "action": action,
-                        "x": float(cx),
-                        "y": float(cy),
-                    })
+                    db_queue.put(
+                        {
+                            "person_id": str(global_id),
+                            "frame": int(frame_idx),
+                            "action": action,
+                            "x": float(cx),
+                            "y": float(cy),
+                        }
+                    )
 
-                # рисуем bbox
                 cv2.rectangle(frame, (int(x1), int(y1)), (int(x2), int(y2)), color, 2)
                 cv2.putText(
                     frame,
@@ -598,67 +579,141 @@ def run_dashboard():
                     cv2.FONT_HERSHEY_SIMPLEX,
                     0.5,
                     color,
-                    2
+                    2,
                 )
 
-        # показываем кадр в Streamlit
+        displayed_people_ids = {p["ID"] for p in people_out}
+        displayed_train_ids = {t["ID"] for t in trains_out}
+
+        for gid, state in global_state.items():
+            obj_class = state["class"]
+            max_missed = MISSED_FRAMES.get(obj_class, MISSED_FRAMES[CLASS_PERSON])
+
+            frame_gap = frame_idx - state["last_frame"]
+            if frame_gap <= 0 or frame_gap > max_missed:
+                continue
+
+            bbox = state.get("bbox")
+            if bbox is None:
+                continue
+
+            x1, y1, x2, y2 = bbox
+            last_action = state.get("last_action", "Unknown")
+            lost_label_suffix = " (Lost)"
+
+            if obj_class == CLASS_PERSON:
+                if gid in displayed_people_ids:
+                    continue
+
+                cv2.rectangle(
+                    frame, (int(x1), int(y1)), (int(x2), int(y2)), (0, 255, 0), 2
+                )
+                cv2.putText(
+                    frame,
+                    f"Person {gid}: {last_action}{lost_label_suffix}",
+                    (int(x1), int(y1 - 10)),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.5,
+                    (0, 255, 0),
+                    2,
+                )
+
+                first_seen_time = action_history.get_first_seen_time(gid)
+                first_seen_str = format_time(first_seen_time) if first_seen_time else "N/A"
+
+                people_out.append(
+                    {
+                        "ID": gid,
+                        "Action": action_history.get_current_action_with_duration(gid),
+                        "History": action_history.get_recent_actions_summary(gid),
+                        "First Seen": first_seen_str,
+                        "Frame": state["last_frame"],
+                    }
+                )
+            elif obj_class == CLASS_TRAIN:
+                if gid in displayed_train_ids:
+                    continue
+                if main_train_id is not None and gid != main_train_id:
+                    continue
+
+                cv2.rectangle(
+                    frame, (int(x1), int(y1)), (int(x2), int(y2)), (0, 255, 255), 2
+                )
+                cv2.putText(
+                    frame,
+                    f"Train {gid}: {last_action}{lost_label_suffix}",
+                    (int(x1), int(y1 - 10)),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.5,
+                    (0, 255, 255),
+                    2,
+                )
+
+                arrival_str = format_time(action_history.get_arrival_time(gid))
+                departure_str = format_time(action_history.get_departure_time(gid))
+
+                trains_out.append(
+                    {
+                        "ID": gid,
+                        "Status": last_action,
+                        "Arrived": arrival_str,
+                        "Departed": departure_str,
+                        "Current Action": action_history.get_current_action_with_duration(gid),
+                    }
+                )
+
         frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         video_placeholder.image(frame_rgb, use_container_width=True)
 
-        # таблица людей
         if people_out:
             df_people = pd.DataFrame(people_out)
-            # Стилизация для лучшего отображения истории
-            styled_people = df_people.style.set_properties(**{
-                'max-width': '300px',
-                'font-size': '12px'
-            }, subset=['History'])
-            people_placeholder.dataframe(styled_people, hide_index=True, use_container_width=True)
+            styled_people = df_people.style.set_properties(
+                **{"max-width": "300px", "font-size": "12px"},
+                subset=["History"],
+            )
+            people_placeholder.dataframe(
+                styled_people, hide_index=True, use_container_width=True
+            )
         else:
             people_placeholder.write("Нет активных людей")
 
-        # таблица поездов
         if trains_out:
             df_trains = pd.DataFrame(trains_out)
 
-            # Стилизация для статусов поездов
             def color_train_status(val):
                 if val == "Arrived":
-                    return 'color: #28a745; font-weight: bold;'
-                elif val == "Departed":
-                    return 'color: #dc3545; font-weight: bold;'
-                else:
-                    return ''
+                    return "color: #28a745; font-weight: bold;"
+                if val == "Departed":
+                    return "color: #dc3545; font-weight: bold;"
+                return ""
 
-            styled_trains = df_trains.style.map(color_train_status, subset=['Status'])
-            trains_placeholder.dataframe(styled_trains, hide_index=True, use_container_width=True)
+            styled_trains = df_trains.style.map(
+                color_train_status, subset=["Status"]
+            )
+            trains_placeholder.dataframe(
+                styled_trains, hide_index=True, use_container_width=True
+            )
         else:
             trains_placeholder.write("Нет активных поездов")
 
-    # когда видео закончится
-    st.write("Видео закончилось, обработка завершена.")
-
-    # Вывод полной истории действий перед завершением
     st.subheader("Полная история поездов")
-    all_train_ids = [obj_id for obj_id in action_history.history.keys() if obj_id.startswith('T')]
+    all_train_ids = [
+        obj_id for obj_id in action_history.history.keys() if obj_id.startswith("T")
+    ]
     for train_id in all_train_ids:
         arrival = action_history.get_arrival_time(train_id)
         departure = action_history.get_departure_time(train_id)
 
         st.write(f"**{train_id}**:")
         if arrival:
-            st.write(f"  - Прибыл: {arrival.strftime('%H:%M:%S')}")
+            st.write(f"  - Прибыл: {format_time(arrival)}")
         if departure:
-            st.write(f"  - Уехал: {departure.strftime('%H:%M:%S')}")
+            st.write(f"  - Уехал: {format_time(departure)}")
 
     db_queue.join()
     db_queue.put(None)
     db_thread.join()
 
 
-# --------------------------------------------------
-#   ТОЧКА ВХОДА
-# --------------------------------------------------
 if __name__ == "__main__":
-    # запускать через:  streamlit run Main.py
     run_dashboard()
