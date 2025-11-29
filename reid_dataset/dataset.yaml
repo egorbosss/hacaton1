@@ -1,7 +1,0 @@
-names:
-- person
-nc: 1
-path: C:\Users\asus\Documents\GitHub\hacaton1\reid_dataset
-test: test
-train: train
-val: val
