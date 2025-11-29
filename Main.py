@@ -1,12 +1,22 @@
 from ultralytics import YOLO
-import threading
-import queue
 import cv2
 import collections
 import math
-import json
-from gs_writer import append_event
 import torch
+#for db
+from sqlalchemy import Column, Integer, String, Float
+import queue
+import threading
+from db import SessionLocal, Detection, reset_db
+#------
+#____Очистка таблицы при старте программы____
+session = SessionLocal()
+session.query(Detection).delete()
+session.commit()
+session.close()
+print("[DB] drop OK")
+#_____________________________________________
+
 
 if torch.cuda.is_available():
     DEVICE = "cuda"
@@ -31,29 +41,60 @@ TRAIN_CONF_THRESHOLD = 0.7
 MIN_TRAIN_REL_HEIGHT = 0.2
 TRAIN_RESET_FRAMES = 200
 
-send_queue = queue.Queue()
+#Уменьшение FPS исходного видео                       
+def ensure_20_fps(video_path: str, target_fps: int = 5) -> str:
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        print("Не удалось открыть видео:", video_path)
+        return video_path
 
+    orig_fps = cap.get(cv2.CAP_PROP_FPS) or 0
+    if orig_fps <= 0:
+        cap.release()
+        return video_path
 
-def sender_worker():
+    if orig_fps <= target_fps:
+        cap.release()
+        print(f"FPS видео {orig_fps:.2f} <= {target_fps}, перерасчет не нужен")
+        return video_path
+
+    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+
+    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+    parts = video_path.rsplit(".", 1)
+    if len(parts) == 2:
+        out_path = parts[0] + f"_fps{target_fps}." + parts[1]
+    else:
+        out_path = video_path + f"_fps{target_fps}.mp4"
+
+    out = cv2.VideoWriter(out_path, fourcc, target_fps, (width, height))
+
+    ratio = orig_fps / target_fps
+    acc = 0.0
+
     while True:
-        item = send_queue.get()
-        if item is None:
+        ret, frame = cap.read()
+        if not ret:
             break
-        frame_idx, global_id, action, cx, cy, obj_type = item
-        try:
-            append_event(frame_idx, global_id, action, cx, cy, obj_type)
-        except Exception as e:
-            print("Ошибка отправки:", e)
-        send_queue.task_done()
+        acc += 1.0
+        if acc >= ratio:
+            out.write(frame)
+            acc -= ratio
+
+    cap.release()
+    out.release()
+
+    print(f"Видео снижено с {orig_fps:.2f} до {target_fps} fps: {out_path}")
+    return out_path
 
 
-sender_thread = threading.Thread(target=sender_worker, daemon=True)
-sender_thread.start()
+PROCESSED_VIDEO_PATH = ensure_20_fps(VIDEO_PATH)
 
 model = YOLO(MODEL_PATH)
 
 results = model.track(
-    source=VIDEO_PATH,
+    source=PROCESSED_VIDEO_PATH,
     stream=True,
     show=False,
     tracker="bytetrack.yaml",
@@ -67,7 +108,7 @@ results = model.track(
     verbose=True
 )
 
-window_name = "People and Train tracking - GPU"
+window_name = "People and Train tracking - " + DEVICE
 cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
 cv2.resizeWindow(window_name, 800, 600)
 
@@ -81,6 +122,42 @@ main_train_id = None
 
 frame_idx = 0
 
+#for DB_____________________________________________________
+db_queue = queue.Queue() 
+def db_worker():
+    """Фоновый поток: забирает данные из очереди и пишет их в БД."""
+    session = SessionLocal()
+    while True:
+        item = db_queue.get()
+        if item is None:
+            break  # сигнал на завершение
+
+        try:
+            # вытащим только цифры из person_id, "P12" -> 12
+            raw_pid = str(item["person_id"])
+            pid = int(''.join(ch for ch in raw_pid if ch.isdigit()))
+
+            det = Detection(
+                person_id=pid,
+                frame=item["frame"],
+                action=item["action"],
+                x=item["x"],
+                y=item["y"],
+            )
+            session.add(det)
+            session.commit()
+            print(f"[DB] saved: person_id={pid}, frame={item['frame']}, action={item['action']}")
+        except Exception as e:
+            session.rollback()
+            print("DB error:", e)
+        finally:
+            db_queue.task_done()
+
+    session.close()
+# запускаем поток
+db_thread = threading.Thread(target=db_worker, daemon=True)
+db_thread.start()
+#__________________________________________________________
 
 def analyze_person_movement(positions):
     if len(positions) < 2:
@@ -245,8 +322,15 @@ for result in results:
                 "type": obj_type
             }
 
-            if frame_idx % SEND_EVERY_N_FRAMES == 0:
-                send_queue.put((frame_idx, global_id, action, cx, cy, obj_type))
+            if frame_idx % SEND_EVERY_N_FRAMES == 10:
+                #_____________________________[DB] sending to queue________________
+                db_queue.put({
+                    "person_id": str(global_id),
+                    "frame": int(frame_idx),
+                    "action": action,
+                    "x": float(cx),
+                    "y": float(cy),
+                })
 
             cv2.rectangle(frame, (int(x1), int(y1)), (int(x2), int(y2)), color, 2)
             cv2.putText(
@@ -282,8 +366,10 @@ for result in results:
 
 cv2.destroyAllWindows()
 
-send_queue.join()
-send_queue.put(None)
-sender_thread.join()
+
+#[DB]
+db_queue.join()
+db_queue.put(None)
+db_thread.join()
 
 print("\nГотово: обработка завершена")
