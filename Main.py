@@ -3,12 +3,15 @@ import cv2
 import collections
 import math
 import torch
-#for db
 from sqlalchemy import Column, Integer, String, Float
 import queue
 import threading
 from db import SessionLocal, Detection, reset_db
-#------
+# next for gui
+import streamlit as st
+import pandas as pd
+from datetime import datetime
+
 #____Очистка таблицы при старте программы____
 session = SessionLocal()
 session.query(Detection).delete()
@@ -17,7 +20,7 @@ session.close()
 print("[DB] drop OK")
 #_____________________________________________
 
-
+# ---- выбор устройства ----
 if torch.cuda.is_available():
     DEVICE = "cuda"
 elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
@@ -27,7 +30,7 @@ else:
 
 print(f"Using device: {DEVICE}")
 
-VIDEO_PATH = "videos/ремонты.mov"
+VIDEO_PATH = "videos/video.mp4"
 MODEL_PATH = "yolo11x.pt"
 train_arrived = False
 
@@ -41,7 +44,9 @@ TRAIN_CONF_THRESHOLD = 0.7
 MIN_TRAIN_REL_HEIGHT = 0.2
 TRAIN_RESET_FRAMES = 200
 
-#Уменьшение FPS исходного видео                       
+# --------------------------------------------------
+# Уменьшение FPS исходного видео
+# --------------------------------------------------
 def ensure_20_fps(video_path: str, target_fps: int = 5) -> str:
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
@@ -91,39 +96,14 @@ def ensure_20_fps(video_path: str, target_fps: int = 5) -> str:
 
 PROCESSED_VIDEO_PATH = ensure_20_fps(VIDEO_PATH)
 
+# ---- модель YOLO ----
 model = YOLO(MODEL_PATH)
 
-results = model.track(
-    source=PROCESSED_VIDEO_PATH,
-    stream=True,
-    show=False,
-    tracker="bytetrack.yaml",
-    classes=[0, 6],
-    persist=True,
-    device=DEVICE,
-    imgsz=1080,
-    conf=0.5,
-    iou=0.5,
-    vid_stride=VID_STRIDE,
-    verbose=True
-)
+# --------------------------------------------------
+#  DB: очередь + поток
+# --------------------------------------------------
+db_queue = queue.Queue()
 
-window_name = "People and Train tracking - " + DEVICE
-cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
-cv2.resizeWindow(window_name, 800, 600)
-
-position_history = collections.defaultdict(lambda: collections.deque(maxlen=10))
-size_history = collections.defaultdict(lambda: collections.deque(maxlen=10))
-trackid_to_global = {}
-global_state = {}
-next_person_id = 1
-next_train_id = 1
-main_train_id = None
-
-frame_idx = 0
-
-#for DB_____________________________________________________
-db_queue = queue.Queue() 
 def db_worker():
     """Фоновый поток: забирает данные из очереди и пишет их в БД."""
     session = SessionLocal()
@@ -133,7 +113,6 @@ def db_worker():
             break  # сигнал на завершение
 
         try:
-            # вытащим только цифры из person_id, "P12" -> 12
             raw_pid = str(item["person_id"])
             pid = int(''.join(ch for ch in raw_pid if ch.isdigit()))
 
@@ -146,7 +125,7 @@ def db_worker():
             )
             session.add(det)
             session.commit()
-            print(f"[DB] saved: person_id={pid}, frame={item['frame']}, action={item['action']}")
+            # print(f"[DB] saved: person_id={pid}, frame={item['frame']}, action={item['action']}")
         except Exception as e:
             session.rollback()
             print("DB error:", e)
@@ -154,11 +133,14 @@ def db_worker():
             db_queue.task_done()
 
     session.close()
-# запускаем поток
+
 db_thread = threading.Thread(target=db_worker, daemon=True)
 db_thread.start()
-#__________________________________________________________
 
+
+# --------------------------------------------------
+#  ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ АНАЛИЗА
+# --------------------------------------------------
 def analyze_person_movement(positions):
     if len(positions) < 2:
         return "Standing"
@@ -204,7 +186,7 @@ def analyze_train_movement(positions, sizes):
     return "Arriving"
 
 
-def find_matching_global_id(center, frame_idx, obj_class):
+def find_matching_global_id(center, frame_idx, obj_class, global_state):
     best_gid = None
     best_dist = None
     for gid, st in global_state.items():
@@ -232,144 +214,271 @@ def get_object_type(class_id):
         return f"class_{class_id}"
 
 
-for result in results:
-    frame_idx += 1
-    frame = result.orig_img.copy()
-    frame_h = frame.shape[0]
+# --------------------------------------------------
+#  ФУНКЦИЯ ДАШБОРДА (YOLO + STREAMLIT)
+# --------------------------------------------------
+def run_dashboard():
+    """
+    Запускает дашборд со стримом видео и таблицами людей/поездов.
+    Запуск: streamlit run Main.py
+    """
+    # ----- ОФОРМЛЕНИЕ СТРАНИЦЫ -----
+    st.set_page_config(page_title="Хакатон – Дашборд", layout="wide")
 
-    if main_train_id is not None:
-        st = global_state.get(main_train_id)
-        if st is None or frame_idx - st["last_frame"] > TRAIN_RESET_FRAMES:
-            main_train_id = None
+    st.markdown("""
+    <style>
+    .block-yellow {
+        background-color: #e8b021;
+        padding: 10px;
+        color: #000;
+        font-size: 22px;
+        font-weight: 800;
+        text-align: center;
+        border-radius: 6px;
+        margin-bottom: 10px;
+    }
+    .block-dark {
+        background-color: #2f2f2f;
+        padding: 10px;
+        color: #fff;
+        font-size: 22px;
+        font-weight: 800;
+        text-align: center;
+        border-radius: 6px;
+        margin-bottom: 10px;
+    }
+    .big-time {
+        font-size: 52px;
+        font-weight: 900;
+        text-align: center;
+    }
+    </style>
+    """, unsafe_allow_html=True)
 
-    if result.boxes is not None:
-        for box in result.boxes:
-            if box.id is None:
-                continue
+    # верхняя строка – время
+    top_left, top_center, top_right = st.columns([2, 3, 1])
+    with top_center:
+        time_placeholder = st.empty()
 
-            try:
-                track_id = int(box.id)
-            except:
-                track_id = int(box.id.item())
+    # основная сетка
+    video_col, people_col, train_col = st.columns([3, 2, 2])
+    video_placeholder = video_col.empty()
 
-            bbox = box.xyxy[0].cpu().numpy()
-            x1, y1, x2, y2 = bbox
-            cx = (x1 + x2) / 2
-            cy = (y1 + y2) / 2
-            center = (cx, cy)
+    with people_col:
+        st.markdown('<div class="block-yellow">ЛЮДИ</div>', unsafe_allow_html=True)
+        people_placeholder = st.empty()
 
-            obj_class = int(box.cls.item())
-            obj_type = get_object_type(obj_class)
-            bbox_height = y2 - y1
-            conf_score = float(box.conf.item())
+    with train_col:
+        st.markdown('<div class="block-dark">ПОЕЗДА</div>', unsafe_allow_html=True)
+        trains_placeholder = st.empty()
 
-            if obj_class == 0:
-                if conf_score < PERSON_CONF_THRESHOLD:
-                    continue
-            elif obj_class == 6:
-                rel_h = bbox_height / frame_h
-                if conf_score < TRAIN_CONF_THRESHOLD:
-                    continue
-                if rel_h < MIN_TRAIN_REL_HEIGHT:
-                    continue
-            else:
-                continue
+    # ----- ЛОКАЛЬНЫЕ СТРУКТУРЫ ТРЕКИНГА -----
+    position_history = collections.defaultdict(lambda: collections.deque(maxlen=10))
+    size_history = collections.defaultdict(lambda: collections.deque(maxlen=10))
+    trackid_to_global = {}
+    global_state = {}
+    next_person_id = 1
+    next_train_id = 1
+    main_train_id = None
+    frame_idx = 0
 
-            if track_id in trackid_to_global:
-                global_id = trackid_to_global[track_id]
-            else:
-                match = find_matching_global_id(center, frame_idx, obj_class)
-                if match is not None:
-                    global_id = match
-                else:
-                    if obj_class == 0:
-                        global_id = f"P{next_person_id}"
-                        next_person_id += 1
-                    elif obj_class == 6:
-                        global_id = f"T{next_train_id}"
-                        next_train_id += 1
-                    else:
-                        global_id = f"O{next_person_id}"
-                        next_person_id += 1
+    st.write("Загружаю модель YOLO…")
+    # модель уже загружена глобально: model
 
-                trackid_to_global[track_id] = global_id
+    st.write("Запускаю трекинг видео…")
 
-            if obj_class == 6:
-                if main_train_id is None:
-                    main_train_id = global_id
-                elif global_id != main_train_id:
-                    continue
-
-            position_history[global_id].append(center)
-
-            if obj_class == 6:
-                size_history[global_id].append(bbox_height)
-                action = analyze_train_movement(position_history[global_id], size_history[global_id])
-                color = (0, 255, 255)
-                label = f"Train {global_id}: {action}"
-            else:
-                movement_action = analyze_person_movement(position_history[global_id])
-                size_action = "Close" if bbox_height > frame_h * 0.4 else "Far"
-                action = f"{movement_action} ({size_action})"
-                color = (0, 255, 0)
-                label = f"Person {global_id}: {action}"
-
-            global_state[global_id] = {
-                "last_pos": center,
-                "last_frame": frame_idx,
-                "last_action": action,
-                "class": obj_class,
-                "type": obj_type
-            }
-
-            if frame_idx % SEND_EVERY_N_FRAMES == 10:
-                #_____________________________[DB] sending to queue________________
-                db_queue.put({
-                    "person_id": str(global_id),
-                    "frame": int(frame_idx),
-                    "action": action,
-                    "x": float(cx),
-                    "y": float(cy),
-                })
-
-            cv2.rectangle(frame, (int(x1), int(y1)), (int(x2), int(y2)), color, 2)
-            cv2.putText(
-                frame,
-                label,
-                (int(x1), int(y1 - 10)),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.5,
-                color,
-                2
-            )
-
-    person_count = sum(1 for state in global_state.values() if state["class"] == 0)
-    train_count = sum(1 for state in global_state.values() if state["class"] == 6)
-
-    cv2.putText(
-        frame,
-        f"People: {person_count} | Trains: {train_count} | GPU",
-        (10, 30),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.7,
-        (255, 255, 255),
-        2
+    results = model.track(
+        source=PROCESSED_VIDEO_PATH,
+        stream=True,
+        show=False,
+        tracker="bytetrack.yaml",
+        classes=[0, 6],
+        persist=True,
+        device=DEVICE,
+        imgsz=1080,
+        conf=0.5,
+        iou=0.5,
+        vid_stride=VID_STRIDE,
+        verbose=False
     )
 
-    frame_small = cv2.resize(frame, None, fx=0.5, fy=0.5)
-    cv2.imshow(window_name, frame_small)
+    # ----- ГЛАВНЫЙ ЦИКЛ -----
+    for result in results:
+        frame_idx += 1
+        frame = result.orig_img.copy()
+        frame_h = frame.shape[0]
 
-    if cv2.getWindowProperty(window_name, cv2.WND_PROP_VISIBLE) < 1:
-        break
-    if cv2.waitKey(1) & 0xFF == ord("q"):
-        break
+        # время
+        now = datetime.now().strftime("%H:%M")
+        time_placeholder.markdown(f'<div class="big-time">{now}</div>', unsafe_allow_html=True)
 
-cv2.destroyAllWindows()
+        # сброс главного поезда
+        if main_train_id is not None:
+            st_train = global_state.get(main_train_id)
+            if st_train is None or frame_idx - st_train["last_frame"] > TRAIN_RESET_FRAMES:
+                main_train_id = None
+
+        people_out = []
+        trains_out = []
+
+        if result.boxes is not None:
+            for box in result.boxes:
+                if box.id is None:
+                    continue
+
+                try:
+                    track_id = int(box.id)
+                except:
+                    track_id = int(box.id.item())
+
+                bbox = box.xyxy[0].cpu().numpy()
+                x1, y1, x2, y2 = bbox
+                cx = (x1 + x2) / 2
+                cy = (y1 + y2) / 2
+                center = (cx, cy)
+
+                obj_class = int(box.cls.item())
+                obj_type = get_object_type(obj_class)
+                bbox_height = y2 - y1
+                conf_score = float(box.conf.item())
+
+                # фильтры
+                if obj_class == 0:
+                    if conf_score < PERSON_CONF_THRESHOLD:
+                        continue
+                elif obj_class == 6:
+                    rel_h = bbox_height / frame_h
+                    if conf_score < TRAIN_CONF_THRESHOLD:
+                        continue
+                    if rel_h < MIN_TRAIN_REL_HEIGHT:
+                        continue
+                else:
+                    continue
+
+                # track_id -> global_id
+                if track_id in trackid_to_global:
+                    global_id = trackid_to_global[track_id]
+                else:
+                    match = find_matching_global_id(center, frame_idx, obj_class, global_state)
+                    if match is not None:
+                        global_id = match
+                    else:
+                        if obj_class == 0:
+                            global_id = f"P{next_person_id}"
+                            next_person_id += 1
+                        elif obj_class == 6:
+                            global_id = f"T{next_train_id}"
+                            next_train_id += 1
+                        else:
+                            global_id = f"O{next_person_id}"
+                            next_person_id += 1
+
+                    trackid_to_global[track_id] = global_id
+
+                # главный поезд
+                if obj_class == 6:
+                    if main_train_id is None:
+                        main_train_id = global_id
+                    elif global_id != main_train_id:
+                        continue
+
+                position_history[global_id].append(center)
+
+                # действие
+                if obj_class == 6:
+                    size_history[global_id].append(bbox_height)
+                    action = analyze_train_movement(position_history[global_id], size_history[global_id])
+                    color = (0, 255, 255)
+                    label = f"Train {global_id}: {action}"
+                    trains_out.append({
+                        "ID": global_id,
+                        "Action": action,
+                        "Frame": frame_idx
+                    })
+                else:
+                    movement_action = analyze_person_movement(position_history[global_id])
+                    size_action = "Close" if bbox_height > frame_h * 0.4 else "Far"
+                    action = f"{movement_action} ({size_action})"
+                    color = (0, 255, 0)
+                    label = f"Person {global_id}: {action}"
+                    people_out.append({
+                        "ID": global_id,
+                        "Action": action,
+                        "Frame": frame_idx
+                    })
+
+                global_state[global_id] = {
+                    "last_pos": center,
+                    "last_frame": frame_idx,
+                    "last_action": action,
+                    "class": obj_class,
+                    "type": obj_type
+                }
+
+                # отправка в БД раз в N кадров (люди и поезда)
+                if frame_idx % SEND_EVERY_N_FRAMES == 10:
+                    db_queue.put({
+                        "person_id": str(global_id),
+                        "frame": int(frame_idx),
+                        "action": action,
+                        "x": float(cx),
+                        "y": float(cy),
+                    })
+
+                # рисуем bbox
+                cv2.rectangle(frame, (int(x1), int(y1)), (int(x2), int(y2)), color, 2)
+                cv2.putText(
+                    frame,
+                    label,
+                    (int(x1), int(y1 - 10)),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.5,
+                    color,
+                    2
+                )
+
+        # счётчики
+        person_count = sum(1 for state in global_state.values() if state["class"] == 0)
+        train_count = sum(1 for state in global_state.values() if state["class"] == 6)
+
+        cv2.putText(
+            frame,
+            f"People: {person_count} | Trains: {train_count} | {DEVICE}",
+            (10, 30),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.7,
+            (255, 255, 255),
+            2
+        )
+
+        # показываем кадр в Streamlit
+        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        video_placeholder.image(frame_rgb, use_container_width=True)
+
+        # таблица людей
+        if people_out:
+            df_people = pd.DataFrame(people_out)
+            people_placeholder.dataframe(df_people, hide_index=True, use_container_width=True)
+        else:
+            people_placeholder.write("Нет активных людей")
+
+        # таблица поездов
+        if trains_out:
+            df_trains = pd.DataFrame(trains_out)
+            trains_placeholder.dataframe(df_trains, hide_index=True, use_container_width=True)
+        else:
+            trains_placeholder.write("Нет активных поездов")
+
+    # когда видео закончится
+    st.write("Видео закончилось, обработка завершена.")
+    db_queue.join()
+    db_queue.put(None)
+    db_thread.join()
 
 
-#[DB]
-db_queue.join()
-db_queue.put(None)
-db_thread.join()
-
-print("\nГотово: обработка завершена")
+# --------------------------------------------------
+#   ТОЧКА ВХОДА
+# --------------------------------------------------
+if __name__ == "__main__":
+    # запускать через:  streamlit run Main.py
+    run_dashboard()
