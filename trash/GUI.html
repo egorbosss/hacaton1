@@ -1,0 +1,54 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <title>Google Sheets Stream</title>
+</head>
+<body>
+
+<pre id="out"></pre>
+
+<script>
+
+// ======= НАСТРОЙКИ =======
+const API_KEY = "AIzaSyAMJ_LOYbRXe_G9KPTvsGPGcjJVUG50dR0";
+const SHEET_ID = "120tgj6PDPd6LNfxWnZKYEm3H1Ug2eejl4_SxmbpShSg";  
+const RANGE = "States!A2:E999";   // где A=ID, B=Frame, C=Action, D=X, E=Y
+
+// ======= ФУНКЦИЯ ЗАГРУЗКИ =======
+async function loadData() {
+    try {
+        const url =
+          `https://sheets.googleapis.com/v4/spreadsheets/${SHEET_ID}/values/${RANGE}?key=${API_KEY}`;
+        
+        const res = await fetch(url);
+        const json = await res.json();
+
+        const rows = json.values || [];
+
+        const lines = rows.map(r => {
+            const id = r[0] || "";
+            const frame = r[1] || "";
+            const type = r[2] || "";
+            const x = r[3] || "";
+            const y = r[4] || "";
+            return `${id} ${frame} ${type} ${x} ${y}`;
+        });
+
+        document.getElementById('out').textContent = lines.join("\n");
+
+    } catch (err) {
+        document.getElementById('out').textContent = "error";
+        console.error(err);
+    }
+}
+
+// первый запуск
+loadData();
+
+// автообновление раз в 2с
+setInterval(loadData, 2000);
+
+</script>
+</body>
+</html>
