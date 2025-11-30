@@ -15,8 +15,6 @@ import pytesseract
 from PIL import Image
 
 
-
-
 def get_device():
     if torch.cuda.is_available():
         return "cuda"
@@ -25,13 +23,9 @@ def get_device():
     return "cpu"
 
 
-
 pytesseract.pytesseract.tesseract_cmd = r'C:\Program Files\Tesseract-OCR\tesseract.exe'
 
-
 img = Image.open('number_train/orig.jpg')
-
-
 train_ID = pytesseract.image_to_string(img, lang='rus+eng')
 
 DEVICE = get_device()
@@ -46,7 +40,7 @@ with SessionLocal() as s:
 FRAME_HEIGHT = 720
 
 YOLO_IMGSZ = 960
-YOLO_VID_STRIDE = 50
+YOLO_VID_STRIDE = 2
 
 VIDEO_FPS = 20
 EFFECTIVE_FPS = VIDEO_FPS / YOLO_VID_STRIDE
@@ -88,6 +82,11 @@ K_REID = {
 }
 
 ACTION_STABLE_FRAMES = 5
+
+# Новые параметры для определения статуса работы
+WORKING_ACTION_THRESHOLD = 0.15  # 15% времени должны быть в рабочем статусе (снижено)
+WORKING_MOVEMENT_THRESHOLD = FRAME_HEIGHT * 0.08  # Увеличено - больше движений считаются работой
+MIN_WORKING_DURATION = timedelta(seconds=3)  # Уменьшено минимальное время
 
 db_queue = queue.Queue()
 
@@ -148,6 +147,40 @@ def analyze_person_movement(positions, fps):
     if speed < PERSON_WALK_SPEED:
         return "Walking"
     return "Moving fast"
+
+
+def determine_working_status(action_history, person_id):
+    """Определяет статус Working/Not Working на основе истории действий"""
+    hist = action_history.history.get(person_id)
+    if not hist or len(hist) < 2:  # Уменьшено минимальное количество записей
+        return "Working"  # По умолчанию считаем, что работает
+
+    # Анализируем последние действия
+    recent_actions = list(hist)[-8:]  # Уменьшено количество анализируемых записей
+
+    working_actions_count = 0
+    total_actions = len(recent_actions)
+
+    for record in recent_actions:
+        action = record["action"]
+        duration = record["duration"]
+
+        # Расширенные критерии для "Working":
+        # 1. Стоит на месте, медленно ходит или нормально ходит
+        # 2. Действие длится достаточно долго (уменьшено требование)
+        if (
+                "Standing" in action or "Walking slowly" in action or "Walking" in action) and duration >= MIN_WORKING_DURATION:
+            working_actions_count += 2  # Увеличено влияние рабочих действий
+        # Только быстрое движение = не работает
+        elif "Moving fast" in action:
+            working_actions_count -= 1
+
+    working_ratio = working_actions_count / (total_actions * 2) if total_actions > 0 else 0
+
+    if working_ratio >= WORKING_ACTION_THRESHOLD:
+        return "Working"
+    else:
+        return "Not Working"
 
 
 def analyze_train_movement(positions, sizes):
@@ -381,6 +414,14 @@ def setup_streamlit_ui():
         text-align: center;
         color: #0e0f10
     }
+    .status-working {
+        color: #28a745;
+        font-weight: bold;
+    }
+    .status-not-working {
+        color: #dc3545;
+        font-weight: bold;
+    }
     </style>
     """,
         unsafe_allow_html=True,
@@ -552,12 +593,16 @@ def run_dashboard():
 
                     action_history.record_action(global_id, action, now)
 
+                    # Определяем статус Working/Not Working
+                    working_status = determine_working_status(action_history, global_id)
+
                     first_seen_time = action_history.get_first_seen_time(global_id)
                     first_seen_str = format_time(first_seen_time) if first_seen_time else "N/A"
 
                     people_out.append(
                         {
                             "ID": global_id,
+                            "Status": working_status,  # Новая колонка
                             "Action": action_history.get_current_action_with_duration(global_id),
                             "History": action_history.get_recent_actions_summary(global_id),
                             "First Seen": first_seen_str,
@@ -631,12 +676,16 @@ def run_dashboard():
                     2,
                 )
 
+                # Определяем статус Working/Not Working для потерянных объектов
+                working_status = determine_working_status(action_history, gid)
+
                 first_seen_time = action_history.get_first_seen_time(gid)
                 first_seen_str = format_time(first_seen_time) if first_seen_time else "N/A"
 
                 people_out.append(
                     {
                         "ID": gid,
+                        "Status": working_status,  # Новая колонка
                         "Action": action_history.get_current_action_with_duration(gid),
                         "History": action_history.get_recent_actions_summary(gid),
                         "First Seen": first_seen_str,
@@ -680,7 +729,17 @@ def run_dashboard():
 
         if people_out:
             df_people = pd.DataFrame(people_out)
-            styled_people = df_people.style.set_properties(
+
+            # Функция для стилизации статуса
+            def color_status(val):
+                if val == "Working":
+                    return "color: #28a745; font-weight: bold;"
+                else:
+                    return "color: #dc3545; font-weight: bold;"
+
+            styled_people = df_people.style.map(
+                color_status, subset=["Status"]
+            ).set_properties(
                 **{"max-width": "300px", "font-size": "12px"},
                 subset=["History"],
             )
@@ -730,5 +789,3 @@ def run_dashboard():
 
 if __name__ == "__main__":
     run_dashboard()
-
-
