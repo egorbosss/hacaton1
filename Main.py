@@ -6,13 +6,31 @@ import torch
 import queue
 import threading
 from datetime import datetime, timedelta
-
 import streamlit as st
 import pandas as pd
+import numpy as np
+
+# --- OCR для номера поезда ---
+try:
+    import pytesseract
+    from PIL import Image
+
+    # путь к tesseract (проверь, что он совпадает с твоей установкой)
+    pytesseract.pytesseract.tesseract_cmd = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
+
+    try:
+        img = Image.open("number_train/orig.jpg")
+        TRAIN_ID_TEXT = pytesseract.image_to_string(img, lang="rus+eng").strip()
+        if not TRAIN_ID_TEXT:
+            TRAIN_ID_TEXT = "Unknown"
+    except Exception:
+        TRAIN_ID_TEXT = "Unknown"
+except ImportError:
+    pytesseract = None
+    TRAIN_ID_TEXT = "Unknown"
+# ------------------------------
 
 from db import SessionLocal, Detection
-import pytesseract
-from PIL import Image
 
 
 def get_device():
@@ -23,15 +41,11 @@ def get_device():
     return "cpu"
 
 
-pytesseract.pytesseract.tesseract_cmd = r'C:\Program Files\Tesseract-OCR\tesseract.exe'
-
-img = Image.open('number_train/orig.jpg')
-train_ID = pytesseract.image_to_string(img, lang='rus+eng')
-
 DEVICE = get_device()
 
 VIDEO_PATH = "videos/video.mp4"
-MODEL_PATH = "yolo11x.pt"
+DET_MODEL_PATH = "yolo11x.pt"
+POSE_MODEL_PATH = "yolo11x-pose.pt"
 
 with SessionLocal() as s:
     s.query(Detection).delete()
@@ -40,7 +54,7 @@ with SessionLocal() as s:
 FRAME_HEIGHT = 720
 
 YOLO_IMGSZ = 960
-YOLO_VID_STRIDE = 2
+YOLO_VID_STRIDE = 3  # подвыбор кадров
 
 VIDEO_FPS = 20
 EFFECTIVE_FPS = VIDEO_FPS / YOLO_VID_STRIDE
@@ -83,10 +97,27 @@ K_REID = {
 
 ACTION_STABLE_FRAMES = 5
 
-# Новые параметры для определения статуса работы
-WORKING_ACTION_THRESHOLD = 0.15  # 15% времени должны быть в рабочем статусе (снижено)
-WORKING_MOVEMENT_THRESHOLD = FRAME_HEIGHT * 0.08  # Увеличено - больше движений считаются работой
-MIN_WORKING_DURATION = timedelta(seconds=3)  # Уменьшено минимальное время
+IDLE_STANDING_SEC = 3.0
+IDLE_WALK_SLOW_SEC = 5.0
+
+BODY_KEYPOINT_INDICES = {
+    "left_shoulder": 5,
+    "right_shoulder": 6,
+    "left_elbow": 7,
+    "right_elbow": 8,
+    "left_wrist": 9,
+    "right_wrist": 10,
+    "left_hip": 11,
+    "right_hip": 12,
+    "left_knee": 13,
+    "right_knee": 14,
+    "left_ankle": 15,
+    "right_ankle": 16,
+}
+
+SKELETON_PAIRS_ARMS = [(5, 7), (7, 9), (6, 8), (8, 10)]
+SKELETON_PAIRS_LEGS = [(11, 13), (13, 15), (12, 14), (14, 16)]
+SKELETON_PAIRS_BODY = [(5, 11), (6, 12)]
 
 db_queue = queue.Queue()
 
@@ -131,15 +162,12 @@ db_thread.start()
 def analyze_person_movement(positions, fps):
     if len(positions) < 2:
         return "Standing"
-
     pts = list(positions)
     dist = 0.0
     for (x0, y0), (x1, y1) in zip(pts[:-1], pts[1:]):
         dist += math.hypot(x1 - x0, y1 - y0)
-
     time_s = (len(pts) - 1) / fps
     speed = dist / max(time_s, 1e-3)
-
     if speed < PERSON_STANDING_SPEED:
         return "Standing"
     if speed < PERSON_WALK_SLOW_SPEED:
@@ -149,94 +177,163 @@ def analyze_person_movement(positions, fps):
     return "Moving fast"
 
 
-def determine_working_status(action_history, person_id):
-    """Определяет статус Working/Not Working на основе истории действий"""
-    hist = action_history.history.get(person_id)
-    if not hist or len(hist) < 2:  # Уменьшено минимальное количество записей
-        return "Working"  # По умолчанию считаем, что работает
-
-    # Анализируем последние действия
-    recent_actions = list(hist)[-8:]  # Уменьшено количество анализируемых записей
-
-    working_actions_count = 0
-    total_actions = len(recent_actions)
-
-    for record in recent_actions:
-        action = record["action"]
-        duration = record["duration"]
-
-        # Расширенные критерии для "Working":
-        # 1. Стоит на месте, медленно ходит или нормально ходит
-        # 2. Действие длится достаточно долго (уменьшено требование)
-        if (
-                "Standing" in action or "Walking slowly" in action or "Walking" in action) and duration >= MIN_WORKING_DURATION:
-            working_actions_count += 2  # Увеличено влияние рабочих действий
-        # Только быстрое движение = не работает
-        elif "Moving fast" in action:
-            working_actions_count -= 1
-
-    working_ratio = working_actions_count / (total_actions * 2) if total_actions > 0 else 0
-
-    if working_ratio >= WORKING_ACTION_THRESHOLD:
-        return "Working"
-    else:
-        return "Not Working"
-
-
 def analyze_train_movement(positions, sizes):
     if len(positions) < 3:
         return "Stopped"
-
     x0, y0 = positions[0]
     x1, y1 = positions[-1]
     dist = math.hypot(x1 - x0, y1 - y0)
     steps = len(positions) - 1
     avg_step = dist / max(steps, 1)
-
     rel_size_change = 0.0
     if len(sizes) >= 2 and sizes[0] > 0:
         s0 = sizes[0]
         s1 = sizes[-1]
         rel_size_change = (s1 - s0) / s0
-
     if rel_size_change > 0.05:
         return "Arrived"
-    if rel_size_change < -0.1:
+    if rel_size_change < -0.05:
         return "Departed"
     if avg_step < 0.3 and abs(rel_size_change) < 0.02:
         return "Stopped"
     return "Stopped"
 
 
+def get_body_kpt(kpts, confs, idx, thr=0.5):
+    if confs is None:
+        return None
+    if idx >= len(kpts) or idx >= len(confs):
+        return None
+    if confs[idx] < thr:
+        return None
+
+    pt = kpts[idx]  # может быть (x,y,conf,...) — берём первые две
+    x, y = float(pt[0]), float(pt[1])
+
+    if x == 0 or y == 0:
+        return None
+    return x, y
+
+
+def classify_person_pose(kpts, confs, frame_h):
+    if kpts is None or confs is None:
+        return "Pose: unknown"
+    ls = get_body_kpt(kpts, confs, BODY_KEYPOINT_INDICES["left_shoulder"])
+    rs = get_body_kpt(kpts, confs, BODY_KEYPOINT_INDICES["right_shoulder"])
+    lh = get_body_kpt(kpts, confs, BODY_KEYPOINT_INDICES["left_hip"])
+    rh = get_body_kpt(kpts, confs, BODY_KEYPOINT_INDICES["right_hip"])
+    lw = get_body_kpt(kpts, confs, BODY_KEYPOINT_INDICES["left_wrist"])
+    rw = get_body_kpt(kpts, confs, BODY_KEYPOINT_INDICES["right_wrist"])
+    if ls and rs:
+        shoulders_mid = ((ls[0] + rs[0]) / 2.0, (ls[1] + rs[1]) / 2.0)
+    else:
+        shoulders_mid = None
+    if lh and rh:
+        hips_mid = ((lh[0] + rh[0]) / 2.0, (lh[1] + rh[1]) / 2.0)
+    else:
+        hips_mid = None
+    arms_up = False
+    if ls and lw:
+        if lw[1] < ls[1] - 0.05 * frame_h:
+            arms_up = True
+    if rs and rw:
+        if rw[1] < rs[1] - 0.05 * frame_h:
+            arms_up = True
+    if shoulders_mid and hips_mid:
+        dx = shoulders_mid[0] - hips_mid[0]
+        dy = shoulders_mid[1] - hips_mid[1]
+        if dy == 0:
+            torso_angle = 90.0
+        else:
+            torso_angle = abs(math.degrees(math.atan2(dx, dy)))
+        if arms_up:
+            return "Pose: arms up"
+        if torso_angle < 15:
+            return "Pose: standing straight"
+        if torso_angle < 40:
+            return "Pose: leaning"
+        return "Pose: bending"
+    if arms_up:
+        return "Pose: arms up"
+    return "Pose: unknown"
+
+
+# функция отрисовки костей оставлена, но больше не используется
+def draw_person_skeleton(frame, kpts, confs):
+    if kpts is None or confs is None:
+        return
+
+    def valid(idx):
+        if idx >= len(kpts) or idx >= len(confs):
+            return False
+        if confs[idx] <= 0.5:
+            return False
+        pt = kpts[idx]
+        x, y = float(pt[0]), float(pt[1])
+        return not (x == 0 or y == 0)
+
+    for start, end in SKELETON_PAIRS_ARMS + SKELETON_PAIRS_LEGS + SKELETON_PAIRS_BODY:
+        if not valid(start) or not valid(end):
+            continue
+        pt1 = kpts[start]
+        pt2 = kpts[end]
+        x1, y1 = int(pt1[0]), int(pt1[1])
+        x2, y2 = int(pt2[0]), int(pt2[1])
+        cv2.line(frame, (x1, y1), (x2, y2), (255, 255, 255), 2)
+
+
+def update_work_state(global_id, movement_action, pose_label, frame_idx, person_idle_state):
+    pose_active = any(
+        token in pose_label.lower()
+        for token in ["arms up", "bending", "leaning"]
+    )
+    if pose_active:
+        if global_id in person_idle_state:
+            person_idle_state.pop(global_id, None)
+        return "Working", 0.0
+    idle_types = ("Standing", "Walking slowly")
+    if movement_action not in idle_types:
+        if global_id in person_idle_state:
+            person_idle_state.pop(global_id, None)
+        return "Working", 0.0
+    info = person_idle_state.get(global_id)
+    if info is None or info["type"] != movement_action:
+        info = {"type": movement_action, "start_frame": frame_idx}
+        person_idle_state[global_id] = info
+    frames_idle = frame_idx - info["start_frame"]
+    seconds_idle = frames_idle * YOLO_VID_STRIDE / VIDEO_FPS
+    if movement_action == "Standing":
+        if seconds_idle >= IDLE_STANDING_SEC:
+            return "Not working", seconds_idle
+    else:
+        if seconds_idle >= IDLE_WALK_SLOW_SEC:
+            return "Not working", seconds_idle
+    return "Working", seconds_idle
+
+
 def find_matching_global_id(center, bbox_height, frame_idx, obj_class, global_state):
     best_gid = None
     best_dist = None
     best_gap = None
-
     cx, cy = center
     max_gap = FRAME_GAP.get(obj_class, FRAME_GAP[CLASS_PERSON])
     k_reid = K_REID.get(obj_class, K_REID[CLASS_PERSON])
     max_reid_dist = min(MAX_REID_DISTANCE, k_reid * bbox_height)
-
     for gid, st_state in global_state.items():
         if st_state["class"] != obj_class:
             continue
-
         frame_gap = frame_idx - st_state["last_frame"]
         if frame_gap > max_gap or frame_gap < 0:
             continue
-
         lx, ly = st_state["last_pos"]
         dist = math.hypot(cx - lx, cy - ly)
         if dist > max_reid_dist:
             continue
-
         if best_dist is None:
             best_dist = dist
             best_gid = gid
             best_gap = frame_gap
             continue
-
         if dist < best_dist:
             best_dist = dist
             best_gid = gid
@@ -246,28 +343,22 @@ def find_matching_global_id(center, bbox_height, frame_idx, obj_class, global_st
                 best_gid = gid
                 best_dist = dist
                 best_gap = frame_gap
-
     return best_gid
 
 
 def get_person_conf_threshold(center, frame_idx, global_state):
     best_dist = None
-
     cx, cy = center
     for st_state in global_state.values():
         if st_state["class"] != CLASS_PERSON:
             continue
-
         frame_gap = frame_idx - st_state["last_frame"]
         if frame_gap > PERSON_LOCAL_MAX_FRAME_GAP or frame_gap < 0:
             continue
-
         lx, ly = st_state["last_pos"]
         dist = math.hypot(cx - lx, cy - ly)
-
         if best_dist is None or dist < best_dist:
             best_dist = dist
-
     if best_dist is not None and best_dist <= PERSON_LOCAL_RADIUS:
         return PERSON_CONF_THRESHOLD_NEAR
     return PERSON_CONF_THRESHOLD
@@ -289,14 +380,13 @@ class ActionHistory:
     def _apply_train_events(self, obj_id, action, timestamp):
         if not obj_id.startswith("T"):
             return
-        if action == "Arrived" and obj_id not in self.arrival_times:
+        if action.startswith("Arrived") and obj_id not in self.arrival_times:
             self.arrival_times[obj_id] = timestamp
-        elif action == "Departed" and obj_id not in self.departure_times:
+        elif action.startswith("Departed") and obj_id not in self.departure_times:
             self.departure_times[obj_id] = timestamp
 
     def record_action(self, obj_id, raw_action, timestamp):
         current = self.last_actions.get(obj_id)
-
         if current is None:
             self.last_actions[obj_id] = raw_action
             self.history[obj_id].append(
@@ -319,7 +409,6 @@ class ActionHistory:
                 else:
                     pending["candidate"] = raw_action
                     pending["count"] = 1
-
                 if pending["count"] >= self.stable_frames:
                     self.last_actions[obj_id] = raw_action
                     self.history[obj_id].append(
@@ -332,7 +421,6 @@ class ActionHistory:
                     self._apply_train_events(obj_id, raw_action, timestamp)
                     pending["candidate"] = None
                     pending["count"] = 0
-
         if obj_id in self.last_actions and self.history[obj_id]:
             accepted_action = self.last_actions[obj_id]
             current_record = self.history[obj_id][-1]
@@ -363,7 +451,6 @@ class ActionHistory:
         hist = self.history.get(obj_id)
         if not hist:
             return "No history"
-
         recent = list(hist)[-max_actions:]
         summary_parts = []
         for record in recent:
@@ -373,9 +460,47 @@ class ActionHistory:
         return " → ".join(summary_parts)
 
 
-def setup_streamlit_ui():
-    st.set_page_config(page_title="DFN – СИБИНТЕК", layout="wide")
+# KPI по человеку: время в "Working" / всё время, в процентах
+def calculate_kpi_for_person(action_history: ActionHistory, person_id: str) -> float:
+    hist = action_history.history.get(person_id)
+    if not hist:
+        return 0.0
+    total_duration = sum((r["duration"] for r in hist), timedelta(0))
+    if total_duration.total_seconds() <= 0:
+        return 0.0
+    working_duration = sum(
+        (r["duration"] for r in hist if "Working" in r["action"]),
+        timedelta(0),
+    )
+    kpi = working_duration.total_seconds() / total_duration.total_seconds()
+    return round(kpi * 100, 1)
 
+
+# Глобальный KPI: та же формула, но суммируем по всем людям
+def calculate_global_kpi(action_history: ActionHistory) -> float:
+    total_duration = timedelta(0)
+    working_duration = timedelta(0)
+
+    for obj_id, hist in action_history.history.items():
+        if not str(obj_id).startswith("P"):
+            continue
+        for record in hist:
+            dur = record["duration"]
+            if not isinstance(dur, timedelta):
+                continue
+            total_duration += dur
+            if "Working" in record["action"]:
+                working_duration += dur
+
+    if total_duration.total_seconds() <= 0:
+        return 0.0
+
+    kpi = working_duration.total_seconds() / total_duration.total_seconds()
+    return round(kpi * 100, 1)
+
+
+def setup_streamlit_ui():
+    st.set_page_config(page_title="DFN - СИБИНТЕК", layout="wide")
     st.markdown(
         """
     <style>
@@ -383,10 +508,15 @@ def setup_streamlit_ui():
         color: #201600;
     }
     .stMainBlockContainer {
-        background-color: #ffffff;
+        background-color: #d0d0d0;
     }
     .stMain {
-        background-color: #ffffff;
+        background-color: #d0d0d0;
+    }
+    /* Поднимаем всё содержимое выше */
+    .block-container {
+        padding-top: 0.5rem;
+        margin-top: -2rem;
     }
     .block-yellow {
         background-color: #f6ce45;
@@ -395,60 +525,81 @@ def setup_streamlit_ui():
         font-size: 22px;
         font-weight: 800;
         text-align: center;
-        border-radius: 6px;
-        margin-bottom: 10px;
+        border-radius: 12px;
+        margin-bottom: 0px;
     }
     .block-dark {
-        background-color: #0e0f10;
+        background-color: #3c3c3c;
         padding: 10px;
         color: #fff;
         font-size: 22px;
         font-weight: 800;
         text-align: center;
-        border-radius: 6px;
-        margin-bottom: 10px;
+        border-radius: 12px;
+        margin-bottom: 0px;
     }
     .big-time {
         font-size: 52px;
         font-weight: 900;
         text-align: center;
-        color: #0e0f10
-    }
-    .status-working {
-        color: #28a745;
-        font-weight: bold;
-    }
-    .status-not-working {
-        color: #dc3545;
-        font-weight: bold;
+        color: #0e0f10;
     }
     </style>
     """,
         unsafe_allow_html=True,
     )
 
+    # верхняя полоса: логотип + время
     top_left, top_center, _ = st.columns([2, 3, 1])
     with top_center:
         time_placeholder = st.empty()
     with top_left:
         st.image("static/logo.svg", width=200)
 
-    video_col, people_col, train_col = st.columns([3, 2, 2])
-    video_placeholder = video_col.empty()
+    # вторая строка: видео + глобальный KPI
+    row2_left, row2_right = st.columns([3, 2])
+    with row2_left:
+        video_placeholder = st.empty()
+    with row2_right:
+        st.markdown('<div class="block-yellow">глобальный KPI</div>', unsafe_allow_html=True)
+        kpi_chart_placeholder = st.empty()
 
-    with people_col:
-        st.markdown('<div class="block-yellow">ЛЮДИ</div>', unsafe_allow_html=True)
+    # третья строка: люди / поезда / log
+    row3_left, row3_mid, row3_right = st.columns([3, 2, 1])
+    with row3_left:
+        st.markdown('<div class="block-yellow">люди</div>', unsafe_allow_html=True)
         people_placeholder = st.empty()
-
-    with train_col:
-        st.markdown('<div class="block-dark">ПОЕЗДА</div>', unsafe_allow_html=True)
+    with row3_mid:
+        st.markdown('<div class="block-dark">поезда</div>', unsafe_allow_html=True)
         trains_placeholder = st.empty()
+    with row3_right:
+        st.markdown('<div class="block-dark">log</div>', unsafe_allow_html=True)
+        log_placeholder = st.empty()
 
-    return time_placeholder, video_placeholder, people_placeholder, trains_placeholder
+    return (
+        time_placeholder,
+        video_placeholder,
+        kpi_chart_placeholder,
+        people_placeholder,
+        trains_placeholder,
+        log_placeholder,
+    )
+
+
+# OCR по времени не нужен
+def extract_video_start_time(frame):
+    return None
 
 
 def run_dashboard():
-    time_placeholder, video_placeholder, people_placeholder, trains_placeholder = setup_streamlit_ui()
+    (
+        time_placeholder,
+        video_placeholder,
+        kpi_chart_placeholder,
+        people_placeholder,
+        trains_placeholder,
+        log_placeholder,
+    ) = setup_streamlit_ui()
 
     position_history = collections.defaultdict(
         lambda: collections.deque(maxlen=POSITION_HISTORY_LEN)
@@ -456,19 +607,32 @@ def run_dashboard():
     size_history = collections.defaultdict(
         lambda: collections.deque(maxlen=SIZE_HISTORY_LEN)
     )
-
     trackid_to_global = {}
     global_state = {}
     next_person_id = 1
     next_train_id = 1
     main_train_id = None
     frame_idx = 0
-
     action_history = ActionHistory()
+    person_idle_state = {}
 
-    model = YOLO(MODEL_PATH)
+    kpi_history = []
+    log_rows = []
 
-    results = model.track(
+    cap = cv2.VideoCapture(VIDEO_PATH)
+    ret, first_frame = cap.read()
+    cap.release()
+    if ret:
+        video_start_time = extract_video_start_time(first_frame)
+    else:
+        video_start_time = None
+    if video_start_time is None:
+        video_start_time = datetime.now()
+
+    det_model = YOLO(DET_MODEL_PATH)
+    pose_model = YOLO(POSE_MODEL_PATH)
+
+    results = det_model.track(
         source=VIDEO_PATH,
         stream=True,
         show=False,
@@ -486,11 +650,14 @@ def run_dashboard():
     for result in results:
         frame_idx += 1
         frame = result.orig_img.copy()
-        frame_h = frame.shape[0]
+        frame_h, frame_w = frame.shape[0], frame.shape[1]
 
-        now = datetime.now()
+        elapsed_seconds = (frame_idx - 1) * YOLO_VID_STRIDE / VIDEO_FPS
+        frame_time = video_start_time + timedelta(seconds=elapsed_seconds)
+
+        # Часы без секунд
         time_placeholder.markdown(
-            f'<div class="big-time">{now.strftime("%H:%M")}</div>',
+            f'<div class="big-time">{frame_time.strftime("%H:%M")}</div>',
             unsafe_allow_html=True,
         )
 
@@ -506,17 +673,20 @@ def run_dashboard():
             for box in result.boxes:
                 if box.id is None:
                     continue
-
                 try:
                     track_id = int(box.id)
                 except Exception:
                     track_id = int(box.id.item())
-
                 x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()
+                x1 = max(0, min(frame_w - 1, int(x1)))
+                y1 = max(0, min(frame_h - 1, int(y1)))
+                x2 = max(0, min(frame_w - 1, int(x2)))
+                y2 = max(0, min(frame_h - 1, int(y2)))
+                if x2 <= x1 or y2 <= y1:
+                    continue
                 cx = (x1 + x2) / 2
                 cy = (y1 + y2) / 2
                 center = (cx, cy)
-
                 obj_class = int(box.cls.item())
                 bbox_height = float(y2 - y1)
                 conf_score = float(box.conf.item())
@@ -561,50 +731,73 @@ def run_dashboard():
 
                 if obj_class == CLASS_TRAIN:
                     size_history[global_id].append(bbox_height)
-                    action = analyze_train_movement(
+                    train_action = analyze_train_movement(
                         position_history[global_id],
                         size_history[global_id],
                     )
                     color = (0, 255, 255)
-                    label = f"Train {global_id}: {action}"
-
-                    action_history.record_action(global_id, action, now)
-
+                    label = f"Train {global_id}: {train_action}"
+                    stored_action = train_action
+                    action_history.record_action(global_id, stored_action, frame_time)
                     arrival_str = format_time(action_history.get_arrival_time(global_id))
                     departure_str = format_time(action_history.get_departure_time(global_id))
-
                     trains_out.append(
                         {
-                            "ID": train_ID,
-                            "Status": action,
+                            "ID": TRAIN_ID_TEXT,  # распознанный номер
+                            "Status": train_action,
                             "Arrived": arrival_str,
                             "Departed": departure_str,
                             "Current Action": action_history.get_current_action_with_duration(global_id),
                         }
                     )
                 else:
+                    crop = frame[y1:y2, x1:x2]
+                    pose_label = "Pose: unknown"
+                    if crop.size > 0:
+                        pose_res_list = pose_model(crop, imgsz=YOLO_IMGSZ, verbose=False)
+                        if len(pose_res_list) > 0:
+                            pose_res = pose_res_list[0]
+                            if pose_res.keypoints is not None and len(pose_res.keypoints) > 0:
+                                kpts = pose_res.keypoints.data[0].cpu().numpy()
+                                if hasattr(pose_res.keypoints, "conf") and pose_res.keypoints.conf is not None:
+                                    confs = pose_res.keypoints.conf[0].cpu().numpy()
+                                else:
+                                    confs = np.ones(kpts.shape[0], dtype=np.float32)
+
+                                # сдвигаем только x,y координаты скелета
+                                kpts_vis = kpts.copy()
+                                if kpts_vis.shape[1] >= 2:
+                                    kpts_vis[:, 0] += x1
+                                    kpts_vis[:, 1] += y1
+
+                                pose_label = classify_person_pose(kpts, confs, frame_h)
+                                # Отрисовку костей убрали:
+                                # draw_person_skeleton(frame, kpts_vis, confs)
+
                     movement_action = analyze_person_movement(
                         position_history[global_id], EFFECTIVE_FPS
                     )
                     size_action = "Close" if bbox_height > frame_h * 0.4 else "Far"
-                    action = f"{movement_action} ({size_action})"
-                    color = (0, 255, 0)
-                    label = f"Person {global_id}: {action}"
-
-                    action_history.record_action(global_id, action, now)
-
-                    # Определяем статус Working/Not Working
-                    working_status = determine_working_status(action_history, global_id)
-
+                    work_state, idle_seconds = update_work_state(
+                        global_id, movement_action, pose_label, frame_idx, person_idle_state
+                    )
+                    detail = f"{movement_action} ({size_action}) | {pose_label} | idle={idle_seconds:.1f}s"
+                    color = (0, 255, 0) if work_state == "Working" else (0, 0, 255)
+                    label = f"Person {global_id}: {work_state}"
+                    stored_action = work_state
+                    action_history.record_action(global_id, stored_action, frame_time)
                     first_seen_time = action_history.get_first_seen_time(global_id)
                     first_seen_str = format_time(first_seen_time) if first_seen_time else "N/A"
+
+                    kpi_value = calculate_kpi_for_person(action_history, global_id)
 
                     people_out.append(
                         {
                             "ID": global_id,
-                            "Status": working_status,  # Новая колонка
+                            "Work": work_state,
+                            "KPI": kpi_value,
                             "Action": action_history.get_current_action_with_duration(global_id),
-                            "History": action_history.get_recent_actions_summary(global_id),
+                            "Details": detail,
                             "First Seen": first_seen_str,
                             "Frame": frame_idx,
                         }
@@ -613,7 +806,7 @@ def run_dashboard():
                 global_state[global_id] = {
                     "last_pos": center,
                     "last_frame": frame_idx,
-                    "last_action": action,
+                    "last_action": stored_action,
                     "class": obj_class,
                     "bbox": (x1, y1, x2, y2),
                 }
@@ -623,7 +816,7 @@ def run_dashboard():
                         {
                             "person_id": str(global_id),
                             "frame": int(frame_idx),
-                            "action": action,
+                            "action": stored_action,
                             "x": float(cx),
                             "y": float(cy),
                         }
@@ -646,15 +839,12 @@ def run_dashboard():
         for gid, state in global_state.items():
             obj_class = state["class"]
             max_missed = MISSED_FRAMES.get(obj_class, MISSED_FRAMES[CLASS_PERSON])
-
             frame_gap = frame_idx - state["last_frame"]
             if frame_gap <= 0 or frame_gap > max_missed:
                 continue
-
             bbox = state.get("bbox")
             if bbox is None:
                 continue
-
             x1, y1, x2, y2 = bbox
             last_action = state.get("last_action", "Unknown")
             lost_label_suffix = " (Lost)"
@@ -662,7 +852,6 @@ def run_dashboard():
             if obj_class == CLASS_PERSON:
                 if gid in displayed_people_ids:
                     continue
-
                 cv2.rectangle(
                     frame, (int(x1), int(y1)), (int(x2), int(y2)), (0, 255, 0), 2
                 )
@@ -675,19 +864,16 @@ def run_dashboard():
                     (0, 255, 0),
                     2,
                 )
-
-                # Определяем статус Working/Not Working для потерянных объектов
-                working_status = determine_working_status(action_history, gid)
-
                 first_seen_time = action_history.get_first_seen_time(gid)
                 first_seen_str = format_time(first_seen_time) if first_seen_time else "N/A"
-
+                kpi_value = calculate_kpi_for_person(action_history, gid)
                 people_out.append(
                     {
                         "ID": gid,
-                        "Status": working_status,  # Новая колонка
+                        "Work": last_action,
+                        "KPI": kpi_value,
                         "Action": action_history.get_current_action_with_duration(gid),
-                        "History": action_history.get_recent_actions_summary(gid),
+                        "Details": "",
                         "First Seen": first_seen_str,
                         "Frame": state["last_frame"],
                     }
@@ -697,7 +883,6 @@ def run_dashboard():
                     continue
                 if main_train_id is not None and gid != main_train_id:
                     continue
-
                 cv2.rectangle(
                     frame, (int(x1), int(y1)), (int(x2), int(y2)), (0, 255, 255), 2
                 )
@@ -710,13 +895,11 @@ def run_dashboard():
                     (0, 255, 255),
                     2,
                 )
-
                 arrival_str = format_time(action_history.get_arrival_time(gid))
                 departure_str = format_time(action_history.get_departure_time(gid))
-
                 trains_out.append(
                     {
-                        "ID": train_ID,
+                        "ID": TRAIN_ID_TEXT,
                         "Status": last_action,
                         "Arrived": arrival_str,
                         "Departed": departure_str,
@@ -729,19 +912,9 @@ def run_dashboard():
 
         if people_out:
             df_people = pd.DataFrame(people_out)
-
-            # Функция для стилизации статуса
-            def color_status(val):
-                if val == "Working":
-                    return "color: #28a745; font-weight: bold;"
-                else:
-                    return "color: #dc3545; font-weight: bold;"
-
-            styled_people = df_people.style.map(
-                color_status, subset=["Status"]
-            ).set_properties(
+            styled_people = df_people.style.set_properties(
                 **{"max-width": "300px", "font-size": "12px"},
-                subset=["History"],
+                subset=["Details"],
             )
             people_placeholder.dataframe(
                 styled_people, hide_index=True, use_container_width=True
@@ -768,6 +941,27 @@ def run_dashboard():
         else:
             trains_placeholder.write("Нет активных поездов")
 
+        # Глобальный KPI и график
+        global_kpi = calculate_global_kpi(action_history)
+        kpi_history.append({"time": frame_time, "kpi": global_kpi})
+        df_kpi = pd.DataFrame(kpi_history)
+        df_kpi.set_index("time", inplace=True)
+        kpi_chart_placeholder.line_chart(df_kpi["kpi"])
+
+        # Логи
+        if frame_idx % 10 == 0:
+            log_rows.append(
+                {
+                    "time": frame_time.strftime("%H:%M:%S"),
+                    "frame": frame_idx,
+                    "people": len(people_out),
+                    "trains": len(trains_out),
+                    "kpi": global_kpi,
+                }
+            )
+            df_log = pd.DataFrame(log_rows[-50:])
+            log_placeholder.dataframe(df_log, hide_index=True, use_container_width=True)
+
     st.subheader("Полная история поездов")
     all_train_ids = [
         obj_id for obj_id in action_history.history.keys() if obj_id.startswith("T")
@@ -775,7 +969,6 @@ def run_dashboard():
     for train_id in all_train_ids:
         arrival = action_history.get_arrival_time(train_id)
         departure = action_history.get_departure_time(train_id)
-
         st.write(f"**{train_id}**:")
         if arrival:
             st.write(f"  - Прибыл: {format_time(arrival)}")
