@@ -11,6 +11,10 @@ import streamlit as st
 import pandas as pd
 
 from db import SessionLocal, Detection
+import pytesseract
+from PIL import Image
+
+
 
 
 def get_device():
@@ -20,6 +24,15 @@ def get_device():
         return "mps"
     return "cpu"
 
+
+
+pytesseract.pytesseract.tesseract_cmd = r'C:\Program Files\Tesseract-OCR\tesseract.exe'
+
+
+img = Image.open('number_train/orig.jpg')
+
+
+train_ID = pytesseract.image_to_string(img, lang='rus+eng')
 
 DEVICE = get_device()
 
@@ -33,7 +46,7 @@ with SessionLocal() as s:
 FRAME_HEIGHT = 720
 
 YOLO_IMGSZ = 960
-YOLO_VID_STRIDE = 2
+YOLO_VID_STRIDE = 50
 
 VIDEO_FPS = 20
 EFFECTIVE_FPS = VIDEO_FPS / YOLO_VID_STRIDE
@@ -521,7 +534,7 @@ def run_dashboard():
 
                     trains_out.append(
                         {
-                            "ID": global_id,
+                            "ID": train_ID,
                             "Status": action,
                             "Arrived": arrival_str,
                             "Departed": departure_str,
@@ -654,7 +667,7 @@ def run_dashboard():
 
                 trains_out.append(
                     {
-                        "ID": gid,
+                        "ID": train_ID,
                         "Status": last_action,
                         "Arrived": arrival_str,
                         "Departed": departure_str,
@@ -717,3 +730,5 @@ def run_dashboard():
 
 if __name__ == "__main__":
     run_dashboard()
+
+
