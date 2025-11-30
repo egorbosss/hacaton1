@@ -15,7 +15,6 @@ try:
     import pytesseract
     from PIL import Image
 
-    # путь к tesseract (проверь, что он совпадает с твоей установкой)
     pytesseract.pytesseract.tesseract_cmd = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
 
     try:
@@ -54,7 +53,7 @@ with SessionLocal() as s:
 FRAME_HEIGHT = 720
 
 YOLO_IMGSZ = 960
-YOLO_VID_STRIDE = 3  # подвыбор кадров
+YOLO_VID_STRIDE = 3
 
 VIDEO_FPS = 20
 EFFECTIVE_FPS = VIDEO_FPS / YOLO_VID_STRIDE
@@ -207,7 +206,7 @@ def get_body_kpt(kpts, confs, idx, thr=0.5):
     if confs[idx] < thr:
         return None
 
-    pt = kpts[idx]  # может быть (x,y,conf,...) — берём первые две
+    pt = kpts[idx]
     x, y = float(pt[0]), float(pt[1])
 
     if x == 0 or y == 0:
@@ -258,8 +257,8 @@ def classify_person_pose(kpts, confs, frame_h):
     return "Pose: unknown"
 
 
-# функция отрисовки костей оставлена, но больше не используется
 def draw_person_skeleton(frame, kpts, confs):
+    # больше не используем, но оставляем на будущее
     if kpts is None or confs is None:
         return
 
@@ -460,7 +459,6 @@ class ActionHistory:
         return " → ".join(summary_parts)
 
 
-# KPI по человеку: время в "Working" / всё время, в процентах
 def calculate_kpi_for_person(action_history: ActionHistory, person_id: str) -> float:
     hist = action_history.history.get(person_id)
     if not hist:
@@ -476,7 +474,6 @@ def calculate_kpi_for_person(action_history: ActionHistory, person_id: str) -> f
     return round(kpi * 100, 1)
 
 
-# Глобальный KPI: та же формула, но суммируем по всем людям
 def calculate_global_kpi(action_history: ActionHistory) -> float:
     total_duration = timedelta(0)
     working_duration = timedelta(0)
@@ -504,16 +501,15 @@ def setup_streamlit_ui():
     st.markdown(
         """
     <style>
+    .stMainBlockContainer{
+        background-color: 	#C0C0C0;
+    }
     p {
         color: #201600;
     }
-    .stMainBlockContainer {
-        background-color: #d0d0d0;
-    }
     .stMain {
-        background-color: #d0d0d0;
+        background-color: 	#C0C0C0;
     }
-    /* Поднимаем всё содержимое выше */
     .block-container {
         padding-top: 0.5rem;
         margin-top: -2rem;
@@ -529,7 +525,7 @@ def setup_streamlit_ui():
         margin-bottom: 0px;
     }
     .block-dark {
-        background-color: #3c3c3c;
+        background-color: #202020;
         padding: 10px;
         color: #fff;
         font-size: 22px;
@@ -544,37 +540,75 @@ def setup_streamlit_ui():
         text-align: center;
         color: #0e0f10;
     }
+    .stAppToolbar, .stAppHeader{
+        visibility: hidden;
+    }
+    div.stButton > button {
+        background-color: #d40000 !important;   /* ярко-красный фон */
+        color: white !important;                /* белый текст */
+        font-weight: 700 !important;
+        border-radius: 8px !important;
+        border: 2px solid #8b0000 !important;   /* тёмно-красная рамка */
+        padding: 8px 16px !important;
+    }
+    div.stButton > button:hover {
+        background-color: #ff1a1a !important;   /* красный при наведении */
+        color: white !important;
+        border: 2px solid #a00000 !important;
+    }
     </style>
     """,
         unsafe_allow_html=True,
     )
 
-    # верхняя полоса: логотип + время
-    top_left, top_center, _ = st.columns([2, 3, 1])
+    # флаг остановки в session_state
+    if "stop_dashboard" not in st.session_state:
+        st.session_state["stop_dashboard"] = False
+
+    # небольшой отступ сверху
+    st.markdown("<div style='height:25px'></div>", unsafe_allow_html=True)
+
+    # --- РЯД 1: логотип + время + кнопка стоп в правом верхнем углу ---
+    top_left, top_center, top_right = st.columns([2, 3, 1])
     with top_center:
         time_placeholder = st.empty()
     with top_left:
-        st.image("static/logo.svg", width=200)
+        st.image("static/logo1.svg", width=350)
+    with top_right:
+        if st.button("Остановить программу", key="stop_button"):
+            st.session_state["stop_dashboard"] = True
 
-    # вторая строка: видео + глобальный KPI
-    row2_left, row2_right = st.columns([3, 2])
+    # --- РЯД 2: ВИДЕО (3) + KPI (2) ---
+    row2_left, row2_right = st.columns([2, 2])
     with row2_left:
         video_placeholder = st.empty()
     with row2_right:
-        st.markdown('<div class="block-yellow">глобальный KPI</div>', unsafe_allow_html=True)
+        st.markdown(
+            '<div class="block-yellow">глобальный KPI</div>',
+            unsafe_allow_html=True,
+        )
         kpi_chart_placeholder = st.empty()
 
-    # третья строка: люди / поезда / log
-    row3_left, row3_mid, row3_right = st.columns([3, 2, 1])
+    # --- РЯД 3: ЛЮДИ (ширина как у видео) + справа ПОЕЗДА и LOG под графиком ---
+    row3_left, row3_right = st.columns([1, 1])
+
+    # ЛЮДИ — ровно как видео по ширине
     with row3_left:
         st.markdown('<div class="block-yellow">люди</div>', unsafe_allow_html=True)
         people_placeholder = st.empty()
-    with row3_mid:
+
+    # справа: поезда и log, один под другим, с маленьким отступом
+    with row3_right:
+        col_trains, col_log = st.columns([1, 1])  # две колонки в ряд
+
+    with col_trains:
         st.markdown('<div class="block-dark">поезда</div>', unsafe_allow_html=True)
         trains_placeholder = st.empty()
-    with row3_right:
+
+    with col_log:
         st.markdown('<div class="block-dark">log</div>', unsafe_allow_html=True)
         log_placeholder = st.empty()
+
 
     return (
         time_placeholder,
@@ -586,7 +620,7 @@ def setup_streamlit_ui():
     )
 
 
-# OCR по времени не нужен
+
 def extract_video_start_time(frame):
     return None
 
@@ -600,6 +634,11 @@ def run_dashboard():
         trains_placeholder,
         log_placeholder,
     ) = setup_streamlit_ui()
+
+    # если ранее нажали кнопку "Остановить программу" – больше не запускаем обработку
+    if st.session_state.get("stop_dashboard"):
+        st.warning("Мониторинг остановлен. Перезапустите приложение для нового запуска.")
+        return
 
     position_history = collections.defaultdict(
         lambda: collections.deque(maxlen=POSITION_HISTORY_LEN)
@@ -655,7 +694,6 @@ def run_dashboard():
         elapsed_seconds = (frame_idx - 1) * YOLO_VID_STRIDE / VIDEO_FPS
         frame_time = video_start_time + timedelta(seconds=elapsed_seconds)
 
-        # Часы без секунд
         time_placeholder.markdown(
             f'<div class="big-time">{frame_time.strftime("%H:%M")}</div>',
             unsafe_allow_html=True,
@@ -743,7 +781,7 @@ def run_dashboard():
                     departure_str = format_time(action_history.get_departure_time(global_id))
                     trains_out.append(
                         {
-                            "ID": TRAIN_ID_TEXT,  # распознанный номер
+                            "ID": TRAIN_ID_TEXT,
                             "Status": train_action,
                             "Arrived": arrival_str,
                             "Departed": departure_str,
@@ -764,15 +802,12 @@ def run_dashboard():
                                 else:
                                     confs = np.ones(kpts.shape[0], dtype=np.float32)
 
-                                # сдвигаем только x,y координаты скелета
                                 kpts_vis = kpts.copy()
                                 if kpts_vis.shape[1] >= 2:
                                     kpts_vis[:, 0] += x1
                                     kpts_vis[:, 1] += y1
 
                                 pose_label = classify_person_pose(kpts, confs, frame_h)
-                                # Отрисовку костей убрали:
-                                # draw_person_skeleton(frame, kpts_vis, confs)
 
                     movement_action = analyze_person_movement(
                         position_history[global_id], EFFECTIVE_FPS
@@ -941,14 +976,26 @@ def run_dashboard():
         else:
             trains_placeholder.write("Нет активных поездов")
 
-        # Глобальный KPI и график
+        # --- Глобальный KPI и график в карточке без абсолютного позиционирования ---
         global_kpi = calculate_global_kpi(action_history)
         kpi_history.append({"time": frame_time, "kpi": global_kpi})
         df_kpi = pd.DataFrame(kpi_history)
         df_kpi.set_index("time", inplace=True)
-        kpi_chart_placeholder.line_chart(df_kpi["kpi"])
 
-        # Логи
+        with kpi_chart_placeholder.container():
+            st.markdown(
+                """
+                <div style="
+                    padding: 15px;
+                    border-radius: 16px;
+                ">
+                """,
+                unsafe_allow_html=True,
+            )
+            st.line_chart(df_kpi["kpi"])
+            st.markdown("</div>", unsafe_allow_html=True)
+        # ------------------------------------------------------
+
         if frame_idx % 10 == 0:
             log_rows.append(
                 {
