@@ -13,7 +13,6 @@ import os
 import tempfile
 
 
-# --- OCR для номера поезда ---
 try:
     import pytesseract
     from PIL import Image
@@ -35,17 +34,11 @@ try:
 except ImportError:
     pytesseract = None
     TRAIN_ID_TEXT = "Unknown"
-# ------------------------------
 
 from db import SessionLocal, Detection  # noqa: E402
 
 
 def get_device():
-    """
-    Поступающие данные: нет.
-    Функция: определить доступное вычислительное устройство (CPU / CUDA / MPS).
-    Выход: строка с названием устройства ('cpu', 'cuda' или 'mps').
-    """
     if torch.cuda.is_available():
         return "cuda"
     if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
@@ -74,7 +67,7 @@ EFFECTIVE_FPS = VIDEO_FPS / YOLO_VID_STRIDE
 POSITION_HISTORY_LEN = 30
 SIZE_HISTORY_LEN = 30
 
-MAX_REID_DISTANCE = 150  # было 80, увеличено для более устойчивого реидентификатора
+MAX_REID_DISTANCE = 150
 SEND_EVERY_N_FRAMES = 50
 
 CLASS_PERSON = 0
@@ -110,17 +103,13 @@ K_REID = {
 ACTION_STABLE_FRAMES = 5
 
 IDLE_STANDING_SEC = 3.0
-# Быстрее признаём медленно гуляющих людей "не работающими"
 IDLE_WALK_SLOW_SEC = 2.0
 
-# Порог чувствительности движения суставов и наклона корпуса
-ACTIVE_KPT_MOVEMENT_REL = 0.015  # доля высоты кадра
-TORSO_BENT_ANGLE = 20.0  # градусы наклона корпуса для "работает стоя"
+ACTIVE_KPT_MOVEMENT_REL = 0.015
+TORSO_BENT_ANGLE = 20.0
 
-# Радиус вокруг поезда, где Walking трактуем как рабочую активность
-WORK_NEAR_TRAIN_MARGIN_REL = 0.1  # от высоты кадра
-# Радиус траектории, больше которого человек считается гуляющим по депо (transit)
-TRANSIT_RADIUS_REL = 0.18  # от диагонали кадра
+WORK_NEAR_TRAIN_MARGIN_REL = 0.1
+TRANSIT_RADIUS_REL = 0.18
 
 BODY_KEYPOINT_INDICES = {
     "left_shoulder": 5,
@@ -145,23 +134,12 @@ db_queue = queue.Queue()
 
 
 def format_time(dt):
-    """
-    Поступающие данные: объект datetime или None.
-    Функция: привести время к строке формата HH:MM:SS.
-    Выход: строка с временем или '--:--:--' при None.
-    """
     if dt is None:
         return "--:--:--"
     return dt.strftime("%H:%M:%S")
 
 
 def db_worker():
-    """
-    Поступающие данные: элементы из глобальной очереди db_queue (словари с данными
-    детекций) или None для завершения.
-    Функция: фоновая запись данных детекций в базу данных.
-    Выход: нет (работа с побочным эффектом — сохранение в БД).
-    """
     session = SessionLocal()
     try:
         while True:
@@ -187,7 +165,6 @@ def db_worker():
                 if merged_parts:
                     merged_action = " | ".join(merged_parts)
                 else:
-                    # на всякий случай, если ничего не пришло
                     merged_action = str(item.get("action", ""))
 
                 det = Detection(
@@ -213,15 +190,6 @@ db_thread.start()
 
 def analyze_person_movement(positions, fps, global_id=None,
                             speed_history=None):
-    """
-    Поступающие данные: positions — последовательность координат (x, y),
-    fps — эффективная частота кадров,
-    global_id — глобальный ID объекта (для сглаживания),
-    speed_history — словарь с историей скоростей по ID.
-    Функция: оценить скорость движения человека (со сглаживанием)
-    и классифицировать действие.
-    Выход: строка с действием ('Standing', 'Walking', ...).
-    """
     if len(positions) < 2:
         return "Standing"
 
@@ -234,7 +202,6 @@ def analyze_person_movement(positions, fps, global_id=None,
     time_s = (len(pts) - 1) / fps
     speed = dist / max(time_s, 1e-3)
 
-    # сглаживание скорости по истории
     if global_id is not None and speed_history is not None:
         hist = speed_history[global_id]
         hist.append(speed)
@@ -250,12 +217,6 @@ def analyze_person_movement(positions, fps, global_id=None,
 
 
 def analyze_train_movement(positions, sizes):
-    """
-    Поступающие данные: positions — последовательность координат поезда,
-    sizes — последовательность высот bbox поезда.
-    Функция: по смещению и изменению размера определить состояние поезда.
-    Выход: строка с действием ('Arrived', 'Departed', 'Stopped').
-    """
     if len(positions) < 3:
         return "Stopped"
 
@@ -281,12 +242,6 @@ def analyze_train_movement(positions, sizes):
 
 
 def get_body_kpt(kpts, confs, idx, thr=0.5):
-    """
-    Поступающие данные: kpts — массив ключевых точек, confs — массив доверий,
-    idx — индекс точки, thr — порог доверия.
-    Функция: получить координаты ключевой точки по индексу с учётом порога.
-    Выход: кортеж (x, y) или None, если точка невалидна.
-    """
     if confs is None:
         return None
     if idx >= len(kpts) or idx >= len(confs):
@@ -303,13 +258,6 @@ def get_body_kpt(kpts, confs, idx, thr=0.5):
 
 
 def classify_person_pose(kpts, confs, frame_h):
-    """
-    Поступающие данные: kpts — ключевые точки человека, confs — доверия,
-    frame_h — высота кадра.
-    Функция: по положению плеч, бёдер и рук классифицировать позу человека
-    и вернуть текстовую метку и флаги активности.
-    Выход: (строка с описанием позы, словарь флагов).
-    """
     if kpts is None or confs is None:
         return "Pose: unknown", {}
 
@@ -416,13 +364,6 @@ def classify_person_pose(kpts, confs, frame_h):
 
 
 def draw_person_skeleton(frame, kpts, confs):
-    """
-    Поступающие данные: frame — кадр OpenCV, kpts — ключевые точки,
-    confs — доверия к точкам.
-    Функция: нарисовать скелет человека на кадре (руки, ноги, корпус).
-    Выход: нет (модификация переданного кадра frame).
-    """
-    # больше не используем, но оставляем на будущее
     if kpts is None or confs is None:
         return
 
@@ -451,18 +392,6 @@ def draw_person_skeleton(frame, kpts, confs):
 def update_work_state(global_id, movement_action, pose_label, frame_idx,
                       person_idle_state, frame_h, pose_flags=None,
                       kpt_movement=0.0):
-    """
-    Поступающие данные: global_id — ID объекта, movement_action — действие по
-    скорости, pose_label — поза, frame_idx — номер кадра,
-    person_idle_state — словарь состояний простоя,
-    frame_h — высота кадра,
-    pose_flags — доп. флаги позы (руки вверх/вниз, наклон),
-    kpt_movement — среднее движение суставов между последними кадрами (в пикселях).
-    Функция: определить, работает ли человек или бездействует, и накопить
-    время простоя по кадрам.
-    Выход: кортеж (строка состояния 'Working'/'Not working',
-    время простоя в секундах).
-    """
     pose_flags = pose_flags or {}
     pose_label_lower = pose_label.lower()
 
@@ -472,7 +401,6 @@ def update_work_state(global_id, movement_action, pose_label, frame_idx,
         or False
     )
 
-    # руки опущены и человек наклонён/склонён вперёд — типичный "работает стоя"
     if pose_flags.get("hands_down") and pose_flags.get("is_torso_bent"):
         active_by_pose_flags = True
 
@@ -484,7 +412,6 @@ def update_work_state(global_id, movement_action, pose_label, frame_idx,
         kpt_movement > ACTIVE_KPT_MOVEMENT_REL * frame_h
     )
 
-    # если хоть один из признаков активности сработал — считаем, что работает
     if active_by_pose_flags or active_by_text or active_by_joints:
         if global_id in person_idle_state:
             person_idle_state.pop(global_id, None)
@@ -516,13 +443,6 @@ def update_work_state(global_id, movement_action, pose_label, frame_idx,
 
 def find_matching_global_id(center, bbox_height, frame_idx, obj_class,
                             global_state):
-    """
-    Поступающие данные: center — координаты центра bbox, bbox_height —
-    высота bbox, frame_idx — номер кадра, obj_class — класс объекта,
-    global_state — словарь глобальных треков.
-    Функция: найти подходящий глобальный ID по расстоянию и интервалу кадров.
-    Выход: найденный глобальный ID или None.
-    """
     best_gid = None
     best_dist = None
     best_gap = None
@@ -530,7 +450,6 @@ def find_matching_global_id(center, bbox_height, frame_idx, obj_class,
     max_gap = FRAME_GAP.get(obj_class, FRAME_GAP[CLASS_PERSON])
     k_reid = K_REID.get(obj_class, K_REID[CLASS_PERSON])
 
-    # адаптивный максимум по размеру бокса
     adaptive_dist = bbox_height * 0.45 * k_reid
     max_reid_dist = min(MAX_REID_DISTANCE, adaptive_dist)
 
@@ -571,13 +490,6 @@ def find_matching_global_id(center, bbox_height, frame_idx, obj_class,
 
 
 def get_person_conf_threshold(center, frame_idx, global_state):
-    """
-    Поступающие данные: center — координаты центра новой детекции,
-    frame_idx — номер кадра, global_state — словарь глобальных объектов.
-    Функция: в зависимости от близости к уже известным людям выбрать порог
-    доверия для фильтрации детекций.
-    Выход: числовой порог доверия (float).
-    """
     best_dist = None
     cx, cy = center
 
@@ -601,14 +513,6 @@ def get_person_conf_threshold(center, frame_idx, global_state):
 
 
 class ActionHistory:
-    """
-    Поступающие данные: создаётся без входных аргументов либо с параметрами
-    max_history_per_id и stable_frames.
-    Функция: хранить историю действий объектов и вычислять их продолжительность,
-    а также моменты прибытия/отъезда поездов.
-    Выход: объект, предоставляющий методы для работы с историей действий.
-    """
-
     def __init__(self, max_history_per_id=50,
                  stable_frames=ACTION_STABLE_FRAMES):
         self.history = collections.defaultdict(
@@ -623,12 +527,6 @@ class ActionHistory:
         )
 
     def _apply_train_events(self, obj_id, action, timestamp):
-        """
-        Поступающие данные: obj_id — ID объекта, action — строка действия,
-        timestamp — время действия.
-        Функция: для поездов (ID с 'T') зафиксировать прибытие/отъезд.
-        Выход: нет (модификация словарей arrival_times/departure_times).
-        """
         if not obj_id.startswith("T"):
             return
 
@@ -641,13 +539,6 @@ class ActionHistory:
             self.departure_times[obj_id] = timestamp
 
     def record_action(self, obj_id, raw_action, timestamp):
-        """
-        Поступающие данные: obj_id — ID объекта, raw_action — строка действия,
-        timestamp — время действия.
-        Функция: записать действие в историю с учётом устойчивости (stable
-        frames), обновить текущую длительность.
-        Выход: нет (обновляются внутренние структуры history и last_actions).
-        """
         current = self.last_actions.get(obj_id)
         if current is None:
             self.last_actions[obj_id] = raw_action
@@ -694,38 +585,18 @@ class ActionHistory:
                 )
 
     def get_arrival_time(self, obj_id):
-        """
-        Поступающие данные: obj_id — ID поезда.
-        Функция: получить время прибытия поезда.
-        Выход: datetime или None.
-        """
         return self.arrival_times.get(obj_id)
 
     def get_departure_time(self, obj_id):
-        """
-        Поступающие данные: obj_id — ID поезда.
-        Функция: получить время отправления поезда.
-        Выход: datetime или None.
-        """
         return self.departure_times.get(obj_id)
 
     def get_first_seen_time(self, obj_id):
-        """
-        Поступающие данные: obj_id — ID объекта.
-        Функция: вернуть время первого зафиксированного действия объекта.
-        Выход: datetime или None.
-        """
         hist = self.history.get(obj_id)
         if not hist:
             return None
         return hist[0]["timestamp"]
 
     def get_current_action_with_duration(self, obj_id):
-        """
-        Поступающие данные: obj_id — ID объекта.
-        Функция: вернуть текущее действие и его длительность в секундах.
-        Выход: строка вида 'Action (X.Xs)' или 'Unknown'.
-        """
         hist = self.history.get(obj_id)
         if obj_id in self.last_actions and hist:
             current = hist[-1]
@@ -734,12 +605,6 @@ class ActionHistory:
         return "Unknown"
 
     def get_recent_actions_summary(self, obj_id, max_actions=3):
-        """
-        Поступающие данные: obj_id — ID объекта, max_actions — макс. число
-        последних действий.
-        Функция: сформировать краткую цепочку последних действий с временем.
-        Выход: строка с перечислением действий или 'No history'.
-        """
         hist = self.history.get(obj_id)
         if not hist:
             return "No history"
@@ -759,13 +624,6 @@ class ActionHistory:
 
 def calculate_kpi_for_person(action_history: ActionHistory,
                              person_id: str) -> float:
-    """
-    Поступающие данные: action_history — объект ActionHistory,
-    person_id — ID человека ('P...').
-    Функция: рассчитать индивидуальный KPI как долю времени в состоянии
-    'Working'.
-    Выход: KPI в процентах (float, округлён до 0.1).
-    """
     hist = action_history.history.get(person_id)
     if not hist:
         return 0.0
@@ -783,11 +641,6 @@ def calculate_kpi_for_person(action_history: ActionHistory,
 
 
 def calculate_global_kpi(action_history: ActionHistory) -> float:
-    """
-    Поступающие данные: action_history — объект ActionHistory.
-    Функция: рассчитать глобальный KPI по всем людям (ID, начинающиеся с 'P').
-    Выход: KPI в процентах (float, округлён до 0.1).
-    """
     total_duration = timedelta(0)
     working_duration = timedelta(0)
 
@@ -810,24 +663,18 @@ def calculate_global_kpi(action_history: ActionHistory) -> float:
 
 
 def setup_streamlit_ui():
-    """
-    Поступающие данные: нет (использует глобальное состояние Streamlit).
-    Функция: настроить внешний вид страницы и создать все placeholder'ы
-    интерфейса дашборда.
-    Выход: кортеж из 6 placeholder'ов (время, видео, KPI, люди, поезда, лог).
-    """
     st.set_page_config(page_title="DFN - СИБИНТЕК", layout="wide")
     st.markdown(
         """
     <style>
     .stMainBlockContainer{
-        background-color: 	#C0C0C0;
+        background-color: #FFFFFF;
     }
     p {
         color: #201600;
     }
     .stMain {
-        background-color: 	#C0C0C0;
+        background-color: #FFFFFF;
     }
     .block-container {
         padding-top: 0.5rem;
@@ -885,7 +732,6 @@ def setup_streamlit_ui():
 
     st.markdown("<div style='height:25px'></div>", unsafe_allow_html=True)
 
-    # --- РЯД 1: логотип + время + кнопка стоп ---
     top_left, top_center, top_right = st.columns([2, 3, 1])
 
     with top_center:
@@ -896,7 +742,6 @@ def setup_streamlit_ui():
         if st.button("Остановить программу", key="stop_button"):
             st.session_state["stop_dashboard"] = True
 
-    # --- РЯД 2: ВИДЕО + KPI ---
     row2_left, row2_right = st.columns([2, 2])
 
     with row2_left:
@@ -908,7 +753,6 @@ def setup_streamlit_ui():
         )
         kpi_chart_placeholder = st.empty()
 
-    # --- РЯД 3: ЛЮДИ + справа ПОЕЗДА и LOG ---
     row3_left, row3_right = st.columns([1, 1])
 
     with row3_left:
@@ -946,21 +790,10 @@ def setup_streamlit_ui():
 
 
 def extract_video_start_time(frame):
-    """
-    Поступающие данные: frame — первый кадр видео (numpy-массив).
-    Функция: извлечь из кадра реальное время начала видео (OCR и т.п.).
-    Выход: datetime или None (заглушка пока всегда возвращает None).
-    """
     return None
 
 
 def point_rect_distance(x, y, rect):
-    """
-    Поступающие данные: x, y — координаты точки, rect — (x1,y1,x2,y2) прямоугольника.
-    Функция: вычислить евклидово расстояние от точки до границы прямоугольника
-    (0, если точка внутри).
-    Выход: расстояние (float).
-    """
     x1, y1, x2, y2 = rect
     if x1 > x2:
         x1, x2 = x2, x1
@@ -983,13 +816,6 @@ def point_rect_distance(x, y, rect):
 
 
 def run_dashboard():
-    """
-    Поступающие данные: нет (использует глобальные константы, видеофайл,
-    модели YOLO и интерфейс Streamlit).
-    Функция: запустить весь цикл обработки видео, трекинга людей и поезда,
-    расчёта KPI и обновления дашборда.
-    Выход: нет (запускает поток вывода в Streamlit и запись в БД).
-    """
     (
         time_placeholder,
         video_placeholder,
@@ -1013,7 +839,6 @@ def run_dashboard():
         lambda: collections.deque(maxlen=SIZE_HISTORY_LEN),
     )
 
-    # история движения суставов и скорости по людям
     joint_history = collections.defaultdict(
         lambda: collections.deque(maxlen=10),
     )
@@ -1132,7 +957,6 @@ def run_dashboard():
                 else:
                     continue
 
-                # переменные для БД
                 db_status = None
                 db_action_str = None
                 db_details = None
@@ -1207,7 +1031,6 @@ def run_dashboard():
                         },
                     )
 
-                    # для БД
                     db_status = train_action
                     db_action_str = current_action_train
                     db_details = f"Train {global_id}: {train_action}"
@@ -1252,7 +1075,6 @@ def run_dashboard():
                                         dtype=np.float32,
                                     )
 
-                                # kpts_vis для истории движения по кадру
                                 kpts_vis = kpts.copy()
                                 if kpts_vis.shape[1] >= 2:
                                     kpts_vis[:, 0] += x1
@@ -1287,7 +1109,6 @@ def run_dashboard():
                         else "Far"
                     )
 
-                    # проверка: человек внутри бокса поезда?
                     in_train_box = False
                     near_train = False
                     transit_mode = False
@@ -1295,11 +1116,9 @@ def run_dashboard():
                     if main_train_id is not None and main_train_id in global_state:
                         tx1, ty1, tx2, ty2 = global_state[main_train_id]["bbox"]
 
-                        # внутри прямоугольника поезда
                         if tx1 <= cx <= tx2 and ty1 <= cy <= ty2:
                             in_train_box = True
 
-                        # расстояние до поезда
                         dist_to_train = point_rect_distance(
                             cx,
                             cy,
@@ -1309,7 +1128,6 @@ def run_dashboard():
                         if dist_to_train <= margin:
                             near_train = True
 
-                    # анализ траектории: гуляет по депо или локально работает
                     traj = position_history[global_id]
                     if len(traj) >= 10:
                         xs = [p[0] for p in traj]
@@ -1335,15 +1153,12 @@ def run_dashboard():
                         kpt_movement=kpt_movement,
                     )
 
-                    # если человек внутри поезда — безусловно работает
                     if in_train_box:
                         if global_id in person_idle_state:
                             person_idle_state.pop(global_id, None)
                         work_state = "Working"
                         idle_seconds = 0.0
                     else:
-                        # если человек активно гуляет по депо, далеко от поезда —
-                        # считаем это транзитом, а не работой
                         if (
                             movement_action in ("Walking", "Moving fast")
                             and transit_mode
@@ -1404,7 +1219,6 @@ def run_dashboard():
                         },
                     )
 
-                    # для БД: статус + строка Action + Details
                     db_status = work_state
                     db_action_str = current_action_person
                     db_details = detail
@@ -1417,7 +1231,6 @@ def run_dashboard():
                     "bbox": (x1, y1, x2, y2),
                 }
 
-                # отправка в БД (в том числе статус/Action/Details)
                 if frame_idx % SEND_EVERY_N_FRAMES == 10:
                     db_queue.put(
                         {
@@ -1580,11 +1393,6 @@ def run_dashboard():
             df_trains = pd.DataFrame(trains_out)
 
             def color_train_status(val):
-                """
-                Поступающие данные: val — строка статуса поезда.
-                Функция: вернуть CSS-стиль для раскраски статуса.
-                Выход: строка со стилем для pandas Styler.
-                """
                 if val == "Arrived":
                     return "color: #28a745; font-weight: bold;"
                 if val == "Departed":
@@ -1604,9 +1412,23 @@ def run_dashboard():
             trains_placeholder.write("Нет активных поездов")
 
         global_kpi = calculate_global_kpi(action_history)
-        kpi_history.append({"time": frame_time, "kpi": global_kpi})
+        elapsed_total_sec = (frame_time - video_start_time).total_seconds()
+        bucket_10s = int(elapsed_total_sec // 10)
+
+        kpi_history.append(
+            {
+                "bucket_10s": bucket_10s,
+                "kpi": global_kpi,
+            },
+        )
         df_kpi = pd.DataFrame(kpi_history)
-        df_kpi.set_index("time", inplace=True)
+        df_kpi = (
+            df_kpi.groupby("bucket_10s", as_index=True)["kpi"]
+            .mean()
+            .sort_index()
+        )
+        df_kpi.index = df_kpi.index * 10
+        df_kpi.index.name = "seconds"
 
         with kpi_chart_placeholder.container():
             st.markdown(
@@ -1618,7 +1440,7 @@ def run_dashboard():
                 """,
                 unsafe_allow_html=True,
             )
-            st.line_chart(df_kpi["kpi"])
+            st.line_chart(df_kpi)
             st.markdown("</div>", unsafe_allow_html=True)
 
         if frame_idx % 10 == 0:
