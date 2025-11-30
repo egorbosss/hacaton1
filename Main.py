@@ -9,6 +9,9 @@ from datetime import datetime, timedelta
 import streamlit as st
 import pandas as pd
 import numpy as np
+import os
+import tempfile
+
 
 # --- OCR для номера поезда ---
 try:
@@ -71,7 +74,7 @@ EFFECTIVE_FPS = VIDEO_FPS / YOLO_VID_STRIDE
 POSITION_HISTORY_LEN = 30
 SIZE_HISTORY_LEN = 30
 
-MAX_REID_DISTANCE = 80
+MAX_REID_DISTANCE = 150  # было 80, увеличено для более устойчивого реидентификатора
 SEND_EVERY_N_FRAMES = 50
 
 CLASS_PERSON = 0
@@ -107,7 +110,17 @@ K_REID = {
 ACTION_STABLE_FRAMES = 5
 
 IDLE_STANDING_SEC = 3.0
-IDLE_WALK_SLOW_SEC = 5.0
+# Быстрее признаём медленно гуляющих людей "не работающими"
+IDLE_WALK_SLOW_SEC = 2.0
+
+# Порог чувствительности движения суставов и наклона корпуса
+ACTIVE_KPT_MOVEMENT_REL = 0.015  # доля высоты кадра
+TORSO_BENT_ANGLE = 20.0  # градусы наклона корпуса для "работает стоя"
+
+# Радиус вокруг поезда, где Walking трактуем как рабочую активность
+WORK_NEAR_TRAIN_MARGIN_REL = 0.1  # от высоты кадра
+# Радиус траектории, больше которого человек считается гуляющим по депо (transit)
+TRANSIT_RADIUS_REL = 0.18  # от диагонали кадра
 
 BODY_KEYPOINT_INDICES = {
     "left_shoulder": 5,
@@ -158,10 +171,29 @@ def db_worker():
             try:
                 raw_pid = str(item["person_id"])
                 pid = int("".join(ch for ch in raw_pid if ch.isdigit()))
+
+                status = item.get("status")
+                action_str = item.get("action")
+                details = item.get("details")
+
+                merged_parts = []
+                if status:
+                    merged_parts.append(str(status))
+                if action_str:
+                    merged_parts.append(str(action_str))
+                if details:
+                    merged_parts.append(str(details))
+
+                if merged_parts:
+                    merged_action = " | ".join(merged_parts)
+                else:
+                    # на всякий случай, если ничего не пришло
+                    merged_action = str(item.get("action", ""))
+
                 det = Detection(
                     person_id=pid,
                     frame=item["frame"],
-                    action=item["action"],
+                    action=merged_action,
                     x=item["x"],
                     y=item["y"],
                 )
@@ -179,11 +211,15 @@ db_thread = threading.Thread(target=db_worker, daemon=True)
 db_thread.start()
 
 
-def analyze_person_movement(positions, fps):
+def analyze_person_movement(positions, fps, global_id=None,
+                            speed_history=None):
     """
     Поступающие данные: positions — последовательность координат (x, y),
-    fps — эффективная частота кадров.
-    Функция: оценить скорость движения человека и классифицировать действие.
+    fps — эффективная частота кадров,
+    global_id — глобальный ID объекта (для сглаживания),
+    speed_history — словарь с историей скоростей по ID.
+    Функция: оценить скорость движения человека (со сглаживанием)
+    и классифицировать действие.
     Выход: строка с действием ('Standing', 'Walking', ...).
     """
     if len(positions) < 2:
@@ -197,6 +233,12 @@ def analyze_person_movement(positions, fps):
 
     time_s = (len(pts) - 1) / fps
     speed = dist / max(time_s, 1e-3)
+
+    # сглаживание скорости по истории
+    if global_id is not None and speed_history is not None:
+        hist = speed_history[global_id]
+        hist.append(speed)
+        speed = sum(hist) / max(len(hist), 1)
 
     if speed < PERSON_STANDING_SPEED:
         return "Standing"
@@ -264,11 +306,12 @@ def classify_person_pose(kpts, confs, frame_h):
     """
     Поступающие данные: kpts — ключевые точки человека, confs — доверия,
     frame_h — высота кадра.
-    Функция: по положению плеч, бёдер и рук классифицировать позу человека.
-    Выход: строка с описанием позы ('Pose: arms up', ...).
+    Функция: по положению плеч, бёдер и рук классифицировать позу человека
+    и вернуть текстовую метку и флаги активности.
+    Выход: (строка с описанием позы, словарь флагов).
     """
     if kpts is None or confs is None:
-        return "Pose: unknown"
+        return "Pose: unknown", {}
 
     ls = get_body_kpt(
         kpts,
@@ -325,6 +368,17 @@ def classify_person_pose(kpts, confs, frame_h):
         if rw[1] < rs[1] - 0.05 * frame_h:
             arms_up = True
 
+    hands_down = False
+    if lh and lw:
+        if lw[1] > lh[1] + 0.05 * frame_h:
+            hands_down = True
+    if rh and rw:
+        if rw[1] > rh[1] + 0.05 * frame_h:
+            hands_down = True
+
+    torso_angle = None
+    is_torso_bent = False
+
     if shoulders_mid and hips_mid:
         dx = shoulders_mid[0] - hips_mid[0]
         dy = shoulders_mid[1] - hips_mid[1]
@@ -334,17 +388,31 @@ def classify_person_pose(kpts, confs, frame_h):
         else:
             torso_angle = abs(math.degrees(math.atan2(dx, dy)))
 
-        if arms_up:
-            return "Pose: arms up"
-        if torso_angle < 15:
-            return "Pose: standing straight"
-        if torso_angle < 40:
-            return "Pose: leaning"
-        return "Pose: bending"
+        if torso_angle > TORSO_BENT_ANGLE:
+            is_torso_bent = True
 
-    if arms_up:
-        return "Pose: arms up"
-    return "Pose: unknown"
+        if arms_up:
+            pose_label = "Pose: arms up"
+        elif torso_angle < 15:
+            pose_label = "Pose: standing straight"
+        elif torso_angle < 40:
+            pose_label = "Pose: leaning"
+        else:
+            pose_label = "Pose: bending"
+    else:
+        if arms_up:
+            pose_label = "Pose: arms up"
+        else:
+            pose_label = "Pose: unknown"
+
+    flags = {
+        "arms_up": arms_up,
+        "hands_down": hands_down,
+        "is_torso_bent": is_torso_bent,
+        "torso_angle": torso_angle,
+    }
+
+    return pose_label, flags
 
 
 def draw_person_skeleton(frame, kpts, confs):
@@ -381,21 +449,43 @@ def draw_person_skeleton(frame, kpts, confs):
 
 
 def update_work_state(global_id, movement_action, pose_label, frame_idx,
-                      person_idle_state):
+                      person_idle_state, frame_h, pose_flags=None,
+                      kpt_movement=0.0):
     """
     Поступающие данные: global_id — ID объекта, movement_action — действие по
-    скорости, pose_label — поза, frame_idx — номер кадра, person_idle_state —
-    словарь состояний простоя.
+    скорости, pose_label — поза, frame_idx — номер кадра,
+    person_idle_state — словарь состояний простоя,
+    frame_h — высота кадра,
+    pose_flags — доп. флаги позы (руки вверх/вниз, наклон),
+    kpt_movement — среднее движение суставов между последними кадрами (в пикселях).
     Функция: определить, работает ли человек или бездействует, и накопить
     время простоя по кадрам.
     Выход: кортеж (строка состояния 'Working'/'Not working',
     время простоя в секундах).
     """
-    pose_active = any(
-        token in pose_label.lower()
-        for token in ["arms up", "bending", "leaning"]
+    pose_flags = pose_flags or {}
+    pose_label_lower = pose_label.lower()
+
+    active_by_pose_flags = (
+        pose_flags.get("arms_up")
+        or pose_flags.get("is_torso_bent")
+        or False
     )
-    if pose_active:
+
+    # руки опущены и человек наклонён/склонён вперёд — типичный "работает стоя"
+    if pose_flags.get("hands_down") and pose_flags.get("is_torso_bent"):
+        active_by_pose_flags = True
+
+    active_by_text = any(
+        token in pose_label_lower for token in ["arms up", "bending", "leaning"]
+    )
+
+    active_by_joints = (
+        kpt_movement > ACTIVE_KPT_MOVEMENT_REL * frame_h
+    )
+
+    # если хоть один из признаков активности сработал — считаем, что работает
+    if active_by_pose_flags or active_by_text or active_by_joints:
         if global_id in person_idle_state:
             person_idle_state.pop(global_id, None)
         return "Working", 0.0
@@ -439,7 +529,10 @@ def find_matching_global_id(center, bbox_height, frame_idx, obj_class,
     cx, cy = center
     max_gap = FRAME_GAP.get(obj_class, FRAME_GAP[CLASS_PERSON])
     k_reid = K_REID.get(obj_class, K_REID[CLASS_PERSON])
-    max_reid_dist = min(MAX_REID_DISTANCE, k_reid * bbox_height)
+
+    # адаптивный максимум по размеру бокса
+    adaptive_dist = bbox_height * 0.45 * k_reid
+    max_reid_dist = min(MAX_REID_DISTANCE, adaptive_dist)
 
     for gid, st_state in global_state.items():
         if st_state["class"] != obj_class:
@@ -861,6 +954,34 @@ def extract_video_start_time(frame):
     return None
 
 
+def point_rect_distance(x, y, rect):
+    """
+    Поступающие данные: x, y — координаты точки, rect — (x1,y1,x2,y2) прямоугольника.
+    Функция: вычислить евклидово расстояние от точки до границы прямоугольника
+    (0, если точка внутри).
+    Выход: расстояние (float).
+    """
+    x1, y1, x2, y2 = rect
+    if x1 > x2:
+        x1, x2 = x2, x1
+    if y1 > y2:
+        y1, y2 = y2, y1
+
+    dx = 0.0
+    if x < x1:
+        dx = x1 - x
+    elif x > x2:
+        dx = x - x2
+
+    dy = 0.0
+    if y < y1:
+        dy = y1 - y
+    elif y > y2:
+        dy = y - y2
+
+    return math.hypot(dx, dy)
+
+
 def run_dashboard():
     """
     Поступающие данные: нет (использует глобальные константы, видеофайл,
@@ -891,6 +1012,15 @@ def run_dashboard():
     size_history = collections.defaultdict(
         lambda: collections.deque(maxlen=SIZE_HISTORY_LEN),
     )
+
+    # история движения суставов и скорости по людям
+    joint_history = collections.defaultdict(
+        lambda: collections.deque(maxlen=10),
+    )
+    speed_history = collections.defaultdict(
+        lambda: collections.deque(maxlen=5),
+    )
+
     trackid_to_global = {}
     global_state = {}
     next_person_id = 1
@@ -1002,6 +1132,11 @@ def run_dashboard():
                 else:
                     continue
 
+                # переменные для БД
+                db_status = None
+                db_action_str = None
+                db_details = None
+
                 if track_id in trackid_to_global:
                     global_id = trackid_to_global[track_id]
                 else:
@@ -1057,21 +1192,30 @@ def run_dashboard():
                         action_history.get_departure_time(global_id),
                     )
 
+                    current_action_train = (
+                        action_history
+                        .get_current_action_with_duration(global_id)
+                    )
+
                     trains_out.append(
                         {
                             "ID": TRAIN_ID_TEXT,
                             "Status": train_action,
                             "Arrived": arrival_str,
                             "Departed": departure_str,
-                            "Current Action": (
-                                action_history
-                                .get_current_action_with_duration(global_id)
-                            ),
+                            "Current Action": current_action_train,
                         },
                     )
+
+                    # для БД
+                    db_status = train_action
+                    db_action_str = current_action_train
+                    db_details = f"Train {global_id}: {train_action}"
                 else:
                     crop = frame[y1:y2, x1:x2]
                     pose_label = "Pose: unknown"
+                    pose_flags = {}
+                    kpt_movement = 0.0
 
                     if crop.size > 0:
                         pose_res_list = pose_model(
@@ -1108,12 +1252,24 @@ def run_dashboard():
                                         dtype=np.float32,
                                     )
 
+                                # kpts_vis для истории движения по кадру
                                 kpts_vis = kpts.copy()
                                 if kpts_vis.shape[1] >= 2:
                                     kpts_vis[:, 0] += x1
                                     kpts_vis[:, 1] += y1
 
-                                pose_label = classify_person_pose(
+                                if kpts_vis.shape[0] > 0:
+                                    ys = kpts_vis[:, 1].astype(np.float32)
+                                    hist = joint_history[global_id]
+                                    hist.append(ys)
+                                    if len(hist) >= 2:
+                                        kpt_movement = float(
+                                            np.mean(
+                                                np.abs(hist[-1] - hist[-2]),
+                                            ),
+                                        )
+
+                                pose_label, pose_flags = classify_person_pose(
                                     kpts,
                                     confs,
                                     frame_h,
@@ -1122,23 +1278,86 @@ def run_dashboard():
                     movement_action = analyze_person_movement(
                         position_history[global_id],
                         EFFECTIVE_FPS,
+                        global_id,
+                        speed_history,
                     )
                     size_action = (
                         "Close"
                         if bbox_height > frame_h * 0.4
                         else "Far"
                     )
+
+                    # проверка: человек внутри бокса поезда?
+                    in_train_box = False
+                    near_train = False
+                    transit_mode = False
+
+                    if main_train_id is not None and main_train_id in global_state:
+                        tx1, ty1, tx2, ty2 = global_state[main_train_id]["bbox"]
+
+                        # внутри прямоугольника поезда
+                        if tx1 <= cx <= tx2 and ty1 <= cy <= ty2:
+                            in_train_box = True
+
+                        # расстояние до поезда
+                        dist_to_train = point_rect_distance(
+                            cx,
+                            cy,
+                            (tx1, ty1, tx2, ty2),
+                        )
+                        margin = WORK_NEAR_TRAIN_MARGIN_REL * frame_h
+                        if dist_to_train <= margin:
+                            near_train = True
+
+                    # анализ траектории: гуляет по депо или локально работает
+                    traj = position_history[global_id]
+                    if len(traj) >= 10:
+                        xs = [p[0] for p in traj]
+                        ys = [p[1] for p in traj]
+                        mx = sum(xs) / len(xs)
+                        my = sum(ys) / len(ys)
+                        max_dist = max(
+                            math.hypot(x - mx, y - my) for x, y in traj
+                        )
+                        diag = math.hypot(frame_w, frame_h)
+                        radius_thr = TRANSIT_RADIUS_REL * diag
+                        if max_dist > radius_thr:
+                            transit_mode = True
+
                     work_state, idle_seconds = update_work_state(
                         global_id,
                         movement_action,
                         pose_label,
                         frame_idx,
                         person_idle_state,
+                        frame_h,
+                        pose_flags=pose_flags,
+                        kpt_movement=kpt_movement,
                     )
+
+                    # если человек внутри поезда — безусловно работает
+                    if in_train_box:
+                        if global_id in person_idle_state:
+                            person_idle_state.pop(global_id, None)
+                        work_state = "Working"
+                        idle_seconds = 0.0
+                    else:
+                        # если человек активно гуляет по депо, далеко от поезда —
+                        # считаем это транзитом, а не работой
+                        if (
+                            movement_action in ("Walking", "Moving fast")
+                            and transit_mode
+                            and not near_train
+                        ):
+                            if global_id in person_idle_state:
+                                person_idle_state.pop(global_id, None)
+                            work_state = "Not working"
 
                     detail = (
                         f"{movement_action} ({size_action}) | "
-                        f"{pose_label} | idle={idle_seconds:.1f}s"
+                        f"{pose_label} | idle={idle_seconds:.1f}s | "
+                        f"in_train_box={in_train_box} | "
+                        f"near_train={near_train} | transit={transit_mode}"
                     )
                     color = (
                         (0, 255, 0)
@@ -1168,20 +1387,27 @@ def run_dashboard():
                         global_id,
                     )
 
+                    current_action_person = (
+                        action_history
+                        .get_current_action_with_duration(global_id)
+                    )
+
                     people_out.append(
                         {
                             "ID": global_id,
                             "Work": work_state,
                             "KPI": kpi_value,
-                            "Action": (
-                                action_history
-                                .get_current_action_with_duration(global_id)
-                            ),
+                            "Action": current_action_person,
                             "Details": detail,
                             "First Seen": first_seen_str,
                             "Frame": frame_idx,
                         },
                     )
+
+                    # для БД: статус + строка Action + Details
+                    db_status = work_state
+                    db_action_str = current_action_person
+                    db_details = detail
 
                 global_state[global_id] = {
                     "last_pos": center,
@@ -1191,12 +1417,15 @@ def run_dashboard():
                     "bbox": (x1, y1, x2, y2),
                 }
 
+                # отправка в БД (в том числе статус/Action/Details)
                 if frame_idx % SEND_EVERY_N_FRAMES == 10:
                     db_queue.put(
                         {
                             "person_id": str(global_id),
                             "frame": int(frame_idx),
-                            "action": stored_action,
+                            "status": db_status,
+                            "action": db_action_str,
+                            "details": db_details,
                             "x": float(cx),
                             "y": float(cy),
                         },
@@ -1384,7 +1613,7 @@ def run_dashboard():
                 """
                 <div style="
                     padding: 15px;
-                    border-radius: 16px;
+                    border-radius: 15px;
                 ">
                 """,
                 unsafe_allow_html=True,
